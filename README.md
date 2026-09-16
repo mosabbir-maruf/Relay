@@ -385,19 +385,15 @@ See [docs/routing-and-fallbacks.md](docs/routing-and-fallbacks.md) for full conf
 
 ---
 
-## Backend Integration: Qwen via vLLM
+## Self-hosted Qwen / vLLM on Kaggle
 
-Relay provides dedicated integration for self-hosted Qwen models running through vLLM:
+Relay includes first-class support for self-hosted Qwen models running through vLLM on dual NVIDIA Tesla T4 GPUs (such as Kaggle's free GPU tier).
 
-```
-Relay ──► OpenAICompatibleProvider ──► vLLM Entrypoint ──► Qwen3-Coder Weights
-```
-
-- **Backend Serving**: vLLM exposes an OpenAI-compatible server (`python3 -m vllm.entrypoints.openai.api_server`).
-- **Relay Configuration**: Set `QWEN_BASE_URL=http://<host>:<port>/v1` and `QWEN_MODEL=qwen3-coder-30b`.
-- **Testing Setup**: Relay's Qwen integration was verified against `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ` running on dual NVIDIA Tesla T4 GPUs with AWQ 4-bit quantization and tensor parallelism.
-
-See [docs/openai-compatible-setup.md](docs/openai-compatible-setup.md) and [docs/kaggle-qwen.md](docs/kaggle-qwen.md).
+- **Canonical Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md)
+- **Executable Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb)
+- **Infrastructure Scripts**: [infra/kaggle/](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
+- **Verified Serving**: `vllm serve QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ --served-model-name qwen3-coder-30b`
+- **Relay Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your local `.env`.
 
 ---
 

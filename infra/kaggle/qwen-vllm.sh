@@ -136,6 +136,13 @@ start_server() {
     fi
   fi
 
+  # Check if vllm is installed
+  if ! command -v vllm >/dev/null 2>&1; then
+    echo "ERROR: 'vllm' binary not found on PATH." >&2
+    echo "Remediation: pip install -q --no-cache-dir vllm" >&2
+    return 1
+  fi
+
   # Check if port 8000 is occupied
   if command -v lsof >/dev/null 2>&1 && lsof -i ":${PORT}" >/dev/null 2>&1; then
     echo "ERROR: Port ${PORT} is already occupied. Run './qwen-vllm.sh clean' first." >&2

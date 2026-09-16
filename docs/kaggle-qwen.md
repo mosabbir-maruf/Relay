@@ -1,245 +1,334 @@
 # Kaggle Deployment Runbook: Self-Hosted Qwen3-Coder via vLLM
 
-This document is the definitive, reproducible runbook for deploying **`QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ`** on a **Kaggle Notebook with 2× NVIDIA Tesla T4 GPUs** using **vLLM 0.29.0**, and connecting it securely to Relay over a Cloudflare Quick Tunnel.
+This document is the definitive, reproducible runbook for deploying **`QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ`** on a **Kaggle Notebook with 2× NVIDIA Tesla T4 GPUs** using **vLLM 0.29.0**, exposing it over a **Cloudflare Quick Tunnel**, and integrating it with Relay.
 
 > [!NOTE]
 > **Development & Testing Scope**:
-> This setup is designed for development, experimentation, and functional verification of Relay's multi-provider capabilities. Kaggle provides an ephemeral GPU session (up to 9–12 hours). It is **not** a persistent production host. In production environments, deploy vLLM on dedicated servers, Kubernetes clusters, or private cloud VPCs.
+> This setup is designed for development, experimentation, and functional verification of Relay's multi-provider capabilities. Kaggle provides an ephemeral GPU session (up to 9–12 hours). It is **not** a persistent production host. In production environments, deploy vLLM on dedicated GPU servers, Kubernetes clusters, or private cloud VPCs.
 
 ---
 
-## 1. Last Verified Configuration
+## Architecture Overview
 
-This exact configuration was verified on Kaggle hardware on **September 16, 2026**:
+```text
+ Developer / Relay (Local Dev Machine)
+         │
+         │ HTTPS Request (OpenAI-compatible)
+         ▼
+ Cloudflare Quick Tunnel (*.trycloudflare.com)
+         │
+         │ Reverse Proxy over Outbound Tunnel
+         ▼
+ Kaggle Linux Container (dual NVIDIA T4)
+         │
+         │ Loopback (http://127.0.0.1:8000/v1)
+         ▼
+ vLLM Engine (vllm serve, TP=2, FP16, AWQ)
+         │
+         │ Tensor-Parallel Execution
+         ▼
+ Qwen3-Coder-30B-A3B-Instruct-AWQ (30.5B MoE, ~3.3B active)
+```
 
-| Parameter                  | Verified Value                               | Rationale / Constraint                                                                                                                                |
-| :------------------------- | :------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Model**                  | `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ` | 30.5B MoE (~3.3B active). Unquantized FP16 requires 61 GB VRAM (exceeds dual T4 capacity). AWQ 4-bit weights fit in ~15.2 GB total (~7.6 GB per GPU). |
-| **Served Model Name**      | `qwen3-coder-30b`                            | **Must be a single name**. Passing comma-separated values was treated as a literal compound name by vLLM.                                             |
-| **vLLM Version**           | `0.29.0`                                     | Installed via `pip install vllm`.                                                                                                                     |
-| **Hardware**               | 2× NVIDIA Tesla T4                           | 16 GB VRAM per GPU (~15,109 MiB usable).                                                                                                              |
-| **Tensor Parallel Size**   | `2`                                          | Distributes weights evenly across both GPUs (`--tensor-parallel-size 2`).                                                                             |
-| **DType**                  | `float16`                                    | **Mandatory**. Tesla T4 (Turing, compute capability 7.5) does not support native `bfloat16` or `fp8` tensor cores.                                    |
-| **Quantization**           | `awq`                                        | Required to load AWQ 4-bit quantized weights.                                                                                                         |
-| **Max Model Length**       | `4096`                                       | Bounds KV cache allocation to prevent out-of-memory errors on 15 GB VRAM.                                                                             |
-| **Max Num Sequences**      | `4`                                          | Concurrency limit to reserve VRAM for peak activations.                                                                                               |
-| **GPU Memory Utilization** | `0.85`                                       | Leaves ~15% VRAM headroom for PyTorch context, CUDA kernels, and fragmentation.                                                                       |
-| **Enforce Eager**          | `true` (`--enforce-eager`)                   | Disables CUDA graph capture, saving ~1–2 GB VRAM per GPU on memory-constrained T4s.                                                                   |
-| **Trust Remote Code**      | `true` (`--trust-remote-code`)               | Required by the Qwen3 model architecture.                                                                                                             |
-| **Host / Port**            | `0.0.0.0:8000`                               | Exposes standard OpenAI-compatible `/v1` endpoints locally.                                                                                           |
+---
+
+## Verified Configuration Reference
+
+Verified on Kaggle hardware on **September 16, 2026**:
+
+| Parameter                  | Verified Value                               | Rationale & Operational Constraint                                                                                                             |
+| :------------------------- | :------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Model**                  | `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ` | 30.5B MoE (~3.3B active). Unquantized FP16 requires 61 GB VRAM (exceeds dual T4 capacity). AWQ 4-bit fits in ~15.2 GB total (~7.6 GB per GPU). |
+| **Served Model Name**      | `qwen3-coder-30b`                            | **Must be a single name**. Passing comma-separated values causes vLLM to register a literal compound string (`QuantTrio/...,qwen3-coder-30b`). |
+| **vLLM Subcommand**        | `vllm serve`                                 | **Mandatory**. Never use `vllm server` (fails with unrecognized command).                                                                      |
+| **Hardware**               | 2× NVIDIA Tesla T4                           | ~15,109 MiB usable VRAM per GPU.                                                                                                               |
+| **Tensor Parallel Size**   | `2`                                          | Splits model weights evenly across both GPUs (`--tensor-parallel-size 2`).                                                                     |
+| **DType**                  | `float16`                                    | **Mandatory**. Tesla T4 (Turing, compute capability 7.5) lacks hardware support for native `bfloat16` or `fp8` tensor cores.                   |
+| **Quantization**           | `awq`                                        | Required for AWQ 4-bit quantized weight unpacking.                                                                                             |
+| **Max Model Length**       | `4096`                                       | Bounds KV cache allocation to prevent out-of-memory errors on 15 GB VRAM.                                                                      |
+| **Max Num Sequences**      | `4`                                          | Concurrency limit reserving VRAM headroom for activation peaks.                                                                                |
+| **GPU Memory Utilization** | `0.85`                                       | Reserves ~15% VRAM for PyTorch context, CUDA kernels, and memory fragmentation.                                                                |
+| **Enforce Eager**          | `true` (`--enforce-eager`)                   | Bypasses CUDA graph capture, saving ~1–2 GB VRAM overhead per GPU on memory-constrained T4s.                                                   |
+| **Trust Remote Code**      | `true` (`--trust-remote-code`)               | Required by the Qwen3 architecture.                                                                                                            |
+| **Host / Port**            | `0.0.0.0:8000`                               | Exposes standard OpenAI-compatible `/v1` endpoints locally.                                                                                    |
 
 > [!WARNING]
-> Do **NOT** pass `--swap-space`. This flag was rejected by the verified vLLM 0.29.0 installation on Kaggle.  
+> Do **NOT** pass `--swap-space`. This flag was removed/unsupported in vLLM 0.29.0 on Kaggle.
 > Do **NOT** use `vllm server`. The correct CLI subcommand is `vllm serve`.
 
 ---
 
-## 2. Prerequisites & Kaggle Setup
+## How Scripts Get into Kaggle: GitHub vs. Kaggle Filesystem
 
-1. Open or create a new Kaggle Notebook.
-2. In the right sidebar under **Notebook settings**:
-   - **Accelerator**: `GPU T4 x2` _(Requires phone-verified Kaggle account)_.
-   - **Internet**: `On` _(Required to download weights and run the tunnel)_.
-   - **Environment**: `Always use latest environment`.
-3. Verify that `/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib` is present if importing CUDA 13 libraries in Python.
+The management scripts are version-controlled in the Relay GitHub repository:
+
+- GitHub location: `infra/kaggle/*.sh`
+
+They are **not** created manually inside Kaggle. Instead, the notebook or terminal clones the repository into `/kaggle/working/Relay`:
+
+```text
+GitHub Repository:
+https://github.com/mosabbir-maruf/Relay
+         │
+         │ git clone https://github.com/mosabbir-maruf/Relay.git /kaggle/working/Relay
+         ▼
+Kaggle Working Directory:
+/kaggle/working/Relay/
+         ├── infra/
+         │     └── kaggle/
+         │           ├── README.md
+         │           ├── qwen-vllm.sh
+         │           ├── cloudflared.sh
+         │           └── diagnostics.sh
+         └── notebooks/
+               └── qwen-vllm-kaggle.ipynb
+```
+
+After cloning, all scripts reside at `/kaggle/working/Relay/infra/kaggle/*.sh`.
 
 ---
 
-## 3. Step-by-Step Execution Guide
+## 15-Stage Step-by-Step Deployment Runbook
 
-You can run this setup either using the canonical notebook at [`notebooks/qwen-vllm-kaggle.ipynb`](../notebooks/qwen-vllm-kaggle.ipynb) or using the shell scripts in [`infra/kaggle/`](../infra/kaggle/).
+### Stage 1: Kaggle Session Preparation
 
-### Step 1: Environment & GPU Verification
+- **Where**: Kaggle Web Interface.
+- **How**: Create a new notebook at [kaggle.com/code](https://www.kaggle.com/code).
+- **Why**: Sets up an isolated Jupyter compute container.
+- **What to Expect**: Fresh Kaggle notebook with `/kaggle/working` as the default directory.
 
-Verify the dual GPU environment before downloading anything:
+### Stage 2: GPU Accelerator Selection
 
-```bash
-!nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader
-```
+- **Where**: Kaggle Right Sidebar -> Notebook Settings.
+- **How**:
+  1. Set **Accelerator** to `GPU T4 x2` _(requires phone-verified account)_.
+  2. Set **Internet** to `On` _(mandatory for cloning repo, downloading model weights, and establishing tunnel)_.
+  3. Set **Environment** to `Always use latest environment`.
+- **Why**: Tensor parallelism (`--tensor-parallel-size 2`) strictly requires two physical GPUs.
+- **What to Expect**: `nvidia-smi` shows two Tesla T4 devices.
+- **What if it fails**: If `GPU T4 x2` is grayed out, verify your Kaggle account with a phone number.
 
-_Expected output_: Two lines reporting `Tesla T4` with ~15,109 MiB free each.
+### Stage 3: Open the Canonical Notebook
 
-### Step 2: Install vLLM & cloudflared
+- **Where**: Kaggle Notebook Editor.
+- **How**: Import or copy cells from [`notebooks/qwen-vllm-kaggle.ipynb`](../notebooks/qwen-vllm-kaggle.ipynb).
+- **Why**: Provides a cell-by-cell execution runner that orchestrates the automation scripts.
 
-```bash
-%%bash
-pip install -q --no-cache-dir vllm
-wget -q -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /kaggle/working/cloudflared
-chmod +x /kaggle/working/cloudflared
-```
+### Stage 4: Clone the Relay Repository
 
-### Step 3: Clean Stale Processes (If Restarting)
+- **Where**: Kaggle Notebook Cell or Terminal.
+- **How**:
+  ```bash
+  git clone https://github.com/mosabbir-maruf/Relay.git /kaggle/working/Relay
+  cd /kaggle/working/Relay
+  ```
+- **Where the files are**: `/kaggle/working/Relay/infra/kaggle/`
+- **Why**: Pulls the version-controlled management scripts into the container filesystem.
+- **What to Expect**: Cloned repository at `/kaggle/working/Relay`, commit SHA printed.
+- **What if it fails**: If `/kaggle/working/Relay` already exists, inspect `git status` or reuse the directory.
 
-If restarting after a failure, stale Python workers may still occupy GPU memory:
+### Stage 5: Verify Kaggle Scripts
 
-```bash
-%%bash
-# Safely kill any lingering vLLM processes
-pkill -f vllm || true
-sleep 3
-nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
-```
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  ls -la infra/kaggle/
+  ```
+- **Why**: Verifies `qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`, and `README.md` are present.
+- **What to Expect**: All 4 files exist and are readable.
 
-### Step 4: Launch vLLM in the Background
+### Stage 6: Apply Executable Permissions (`chmod +x`)
 
-> [!IMPORTANT]
-> **Why Background Execution is Mandatory**: A Kaggle notebook cell executes synchronously. Running `vllm serve` in the foreground blocks the notebook indefinitely, preventing you from running subsequent cells to test inference or start the tunnel.
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  chmod +x infra/kaggle/*.sh
+  ```
+- **Why**: Git preserves file content, but Kaggle's mounted filesystem requires explicit POSIX execute permissions (`+x`) before bash or python subprocesses can invoke `./infra/kaggle/<script>.sh` directly.
+- **What to Expect**: `ls -l infra/kaggle/*.sh` confirms `-rwxr-xr-x` permissions.
 
-Launch vLLM with logs piped to `/kaggle/working/vllm_server.log`:
+### Stage 7: Preflight Environment Check & Dependencies
 
-```bash
-%%bash --bg
-export LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH"
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  pip install -q --no-cache-dir vllm
+  ./infra/kaggle/qwen-vllm.sh check
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/qwen-vllm.sh`
+- **Why**: Validates GPU visibility, checks that `vllm` CLI exists, and checks if port 8000 is free.
+- **What to Expect**: Detected 2 GPUs, vLLM CLI path displayed, port 8000 free.
+- **What if it fails**: If `vllm` not found, verify `pip install` succeeded. If fewer than 2 GPUs, check Accelerator settings.
 
-vllm serve QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ \
-  --served-model-name qwen3-coder-30b \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tensor-parallel-size 2 \
-  --dtype float16 \
-  --quantization awq \
-  --max-model-len 4096 \
-  --max-num-seqs 4 \
-  --gpu-memory-utilization 0.85 \
-  --enforce-eager \
-  --trust-remote-code \
-  > /kaggle/working/vllm_server.log 2>&1
-```
+### Stage 8: System & Hardware Diagnostics
 
-### Step 5: Wait for Readiness
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  ./infra/kaggle/diagnostics.sh all
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/diagnostics.sh`
+- **Why**: Runs 10-point check covering GPU memory, PyTorch CUDA device allocation, port occupancy, and background daemons. Useful when recovering from an aborted run.
+- **What to Expect**: GPU status, PyTorch allocation PASS, and port check report.
 
-vLLM takes ~2–3 minutes to download cached weights and compile the KV cache. Poll the `/v1/models` endpoint:
+### Stage 9: Safe Process Cleanup
 
-```python
-import urllib.request, json, time
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  ./infra/kaggle/qwen-vllm.sh clean
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/qwen-vllm.sh`
+- **Why**: Terminates any stale vLLM or Python worker processes holding port 8000 and releases leaked VRAM without touching Jupyter notebook processes.
+- **What to Expect**: "Cleanup complete" or "No stale vLLM processes detected". GPU memory shows ~0 MiB used.
 
-for i in range(120):
-    time.sleep(3)
-    try:
-        req = urllib.request.Request("http://127.0.0.1:8000/v1/models")
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            if resp.status == 200:
-                print("vLLM is ONLINE and healthy!")
-                print(json.loads(resp.read().decode()))
-                break
-    except Exception:
-        if i % 10 == 0:
-            print(f"Loading weights... ({i * 3}s elapsed)")
-```
+### Stage 10: Launch vLLM in Background
 
-### Step 6: Verify Local Inference (PONG Sanity Check)
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  ./infra/kaggle/qwen-vllm.sh start
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/qwen-vllm.sh`
+- **Why**: Launches `vllm serve` with all verified flags via `nohup`, writes PID to `/kaggle/working/vllm.pid`, and redirects logs to `/kaggle/working/vllm_server.log`. Foreground execution would lock the notebook.
+- **What to Expect**: "vLLM process launched with PID: <pid>". Process stays alive past initial 3s check.
+- **What if it fails**: If process exits immediately, view logs: `./infra/kaggle/qwen-vllm.sh logs 50`.
 
-Test prompt completion locally:
+### Stage 11: Wait for vLLM Readiness
 
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-coder-30b",
-    "messages": [{"role": "user", "content": "Reply with only the uppercase word PONG"}],
-    "temperature": 0.0,
-    "max_tokens": 16
-  }'
-```
+- **Where**: Kaggle Notebook / Terminal.
+- **How**: Poll `http://127.0.0.1:8000/v1/models` in a loop with a 10-minute timeout (weights download ~15.2 GB on first run).
+  ```bash
+  # Check status anytime:
+  ./infra/kaggle/qwen-vllm.sh status
+  # Or follow logs live:
+  tail -f /kaggle/working/vllm_server.log
+  ```
+- **Why**: vLLM requires 2–4 minutes to load AWQ weights and pre-allocate the KV cache before the HTTP server accepts traffic.
+- **What to Expect**: Transition from `[WAITING]` to `[READY] (HTTP 200)`.
+- **What if it fails**: If timeout occurs, inspect `/kaggle/working/vllm_server.log`. Check for CUDA OOM or download errors.
 
-_Expected output_: JSON response containing `"content": "PONG"`.
+### Stage 12: Local API Verification
 
-### Step 7: Launch Cloudflare Quick Tunnel
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  # 1. Check model registration
+  curl -s http://127.0.0.1:8000/v1/models
 
-Start `cloudflared` pointing to `http://127.0.0.1:8000` in the background and dynamically extract the public URL:
+  # 2. Run local inference test (sends PONG prompt)
+  ./infra/kaggle/qwen-vllm.sh test
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/qwen-vllm.sh`
+- **Why**: Verifies the local OpenAI-compatible endpoint responds with the exact model alias `qwen3-coder-30b` and generates valid tokens.
+- **What to Expect**: Model list contains `"id": "qwen3-coder-30b"`; test prints `SUCCESS (HTTP 200)` and `PONG`.
 
-```python
-import subprocess, time, re, os
+### Stage 13: Cloudflare Quick Tunnel Provisioning
 
-log_file = "/kaggle/working/cloudflared.log"
-if os.path.exists(log_file):
-    os.remove(log_file)
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  # Check binary (downloads to /kaggle/working/cloudflared if missing)
+  ./infra/kaggle/cloudflared.sh check
 
-proc = subprocess.Popen(
-    ["/kaggle/working/cloudflared", "tunnel", "--url", "http://127.0.0.1:8000", "--logfile", log_file],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL
-)
+  # Launch tunnel in background and discover dynamic URL
+  ./infra/kaggle/cloudflared.sh start
+  ```
+- **Where the file is**: `/kaggle/working/Relay/infra/kaggle/cloudflared.sh`
+- **Why**: Establishes a secure outbound HTTPS tunnel targeting `http://127.0.0.1:8000` without requiring open firewall ports or static public IPs.
+- **What to Expect**: Tunnel PID recorded in `/kaggle/working/cloudflared.pid`, dynamic public URL printed: `https://<random-id>.trycloudflare.com`.
 
-tunnel_url = None
-for _ in range(30):
-    time.sleep(1)
-    if os.path.exists(log_file):
-        with open(log_file) as f:
-            match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", f.read())
-            if match:
-                tunnel_url = match.group(0)
-                break
+### Stage 14: Public Endpoint Testing & Relay Integration
 
-print("Public Tunnel URL:", tunnel_url)
-```
+- **Where**:
+  1. Kaggle Notebook: Run smoke test against the public URL.
+  2. Local Dev Machine: Copy configuration into Relay's `.env`.
+- **How**:
+  In your local Relay repository `.env` on your computer:
+  ```dotenv
+  QWEN_BASE_URL=https://<your-subdomain>.trycloudflare.com/v1
+  QWEN_MODEL=qwen3-coder-30b
+  ```
+  Start Relay locally:
+  ```bash
+  pnpm dev
+  ```
+  Send a test request to Relay:
+  ```bash
+  curl -X POST http://localhost:3000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "qwen3-coder-30b",
+      "messages": [{"role": "user", "content": "Hello Qwen through Relay!"}]
+    }'
+  ```
+- **Why**: Validates end-to-end routing through Relay gateway to Kaggle vLLM.
+- **What to Expect**: Relay streams or returns valid completion from Qwen3-Coder.
 
-### Step 8: Configure Local Relay `.env`
+### Stage 15: Safe Shutdown Procedure
 
-Copy the generated tunnel URL into your local Relay `.env` file:
-
-```dotenv
-QWEN_BASE_URL=https://<your-dynamic-subdomain>.trycloudflare.com/v1
-QWEN_MODEL=qwen3-coder-30b
-```
-
-Run Relay locally:
-
-```bash
-pnpm dev
-```
-
-Test end-to-end through Relay on your machine:
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-coder-30b",
-    "messages": [{"role": "user", "content": "Hello Qwen through Relay!"}]
-  }'
-```
+- **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
+- **How**:
+  ```bash
+  ./infra/kaggle/cloudflared.sh stop
+  ./infra/kaggle/qwen-vllm.sh stop
+  ```
+- **Where the files are**: `/kaggle/working/Relay/infra/kaggle/*.sh`
+- **Why**: Stops the tunnel, sends SIGTERM (then SIGKILL if unresponsive) to vLLM, cleans PID files, and verifies GPU memory is 100% released.
+- **What to Expect**: "Stopped cloudflared", "Process stopped cleanly", GPU memory released to ~0 MiB used.
 
 ---
 
-## 4. Troubleshooting & Diagnostics
+## Troubleshooting Matrix
 
-Run `./infra/kaggle/diagnostics.sh all` or inspect specific conditions:
-
-| Symptom                                             | Probable Cause                                                                             | Remediation                                                                                              |
-| :-------------------------------------------------- | :----------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------- |
-| **CUDA out of memory during startup**               | A prior Python process is still holding VRAM on GPU 0 or 1.                                | Run `pkill -f vllm`, check with `nvidia-smi`, wait 5s for VRAM to drop to 0.                             |
-| **`ImportError: libcudart.so.13`**                  | PyTorch CUDA 13 libraries not on dynamic linker path.                                      | Run `export LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH"`. |
-| **`unrecognized arguments: --swap-space`**          | `--swap-space` flag was deprecated or removed in vLLM 0.29.0.                              | Omit `--swap-space`. Use `--gpu-memory-utilization 0.85` instead.                                        |
-| **Model name returned is compound (`model,alias`)** | Comma-separated values passed to `--served-model-name`.                                    | Pass a single name: `--served-model-name qwen3-coder-30b`.                                               |
-| **Port 8000 already in use**                        | A previous instance is still bound to port 8000.                                           | Run `lsof -ti:8000 \| xargs kill -9`.                                                                    |
-| **Cloudflare Tunnel URL fails to connect**          | vLLM is still compiling KV cache and not yet responding on port 8000.                      | Verify `curl http://127.0.0.1:8000/v1/models` returns 200 before using the public URL.                   |
-| **Public URL returns HTTP 530 / Error 1033**        | Cloudflare Tunnel is running, but the local destination (`http://127.0.0.1:8000`) is down. | Inspect `/kaggle/working/vllm_server.log` to check if vLLM crashed.                                      |
-
----
-
-## 5. Safe Shutdown Procedure
-
-To release GPU memory and terminate processes cleanly:
-
-```bash
-%%bash
-# 1. Stop Cloudflare Tunnel
-pkill -f cloudflared || true
-
-# 2. Stop vLLM server
-pkill -f vllm || true
-sleep 3
-
-# 3. Confirm GPU memory is cleared
-nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader
-```
+| Issue                                                      | Root Cause                                                         | Remediation Steps                                                                                                   |
+| :--------------------------------------------------------- | :----------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| **`vllm: error: unrecognized subcommand 'server'`**        | Using deprecated `vllm server` CLI command.                        | Use canonical `vllm serve`.                                                                                         |
+| **`unrecognized arguments: --swap-space`**                 | `--swap-space` is unsupported in vLLM 0.29.0 on Kaggle.            | Omit `--swap-space`. Manage memory with `--gpu-memory-utilization 0.85`.                                            |
+| **Served model name returned is compound (`model,alias`)** | Comma-separated names passed to `--served-model-name`.             | Pass single string: `--served-model-name qwen3-coder-30b`.                                                          |
+| **Stale vLLM worker processes / High VRAM on startup**     | Prior run aborted without stopping Python workers.                 | Run `./infra/kaggle/qwen-vllm.sh clean`, verify `nvidia-smi` shows ~0 MiB used before restarting.                   |
+| **WorkerProc failed to start**                             | GPU memory exhausted, CUDA mismatch, or port conflict.             | Run `./infra/kaggle/diagnostics.sh all`, clean processes with `qwen-vllm.sh clean`, check `vllm_server.log`.        |
+| **Port 8000 occupied**                                     | Previous server instance still listening.                          | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                                            |
+| **Server running but `/v1/models` not ready**              | Model weights (~15 GB) still downloading or KV cache initializing. | Inspect logs: `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`. Wait up to 5 min. |
+| **`cloudflared` binary missing**                           | Running script before binary download.                             | Run `./infra/kaggle/cloudflared.sh check` to automatically download official release.                               |
+| **Tunnel URL not detected**                                | Network lag or log format delay.                                   | Check logs: `./infra/kaggle/cloudflared.sh logs 30`. Verify internet is enabled in Kaggle settings.                 |
+| **Public endpoint fails (HTTP 530 / Error 1033)**          | Break in the connectivity chain.                                   | **Follow the 6-Step Isolation Workflow below.**                                                                     |
 
 ---
 
-## 6. Important Limitations
+## 6-Step Public Endpoint Failure Isolation Workflow
 
-1. **Session Lifespan**: Kaggle notebook sessions are terminated after 12 hours (or after 60 minutes of inactivity if the browser is closed).
-2. **Ephemeral Storage**: Files in `/kaggle/working` are wiped when the notebook session stops. Re-running the notebook downloads fresh packages and cached weights.
-3. **Dynamic Quick Tunnel URLs**: Every time `cloudflared` starts, Cloudflare assigns a new random `trycloudflare.com` subdomain. You must update `QWEN_BASE_URL` in your local `.env` whenever the tunnel restarts.
-4. **Development Only**: Quick Tunnels have no SLA and are throttled by Cloudflare. For production serving, run vLLM on persistent compute with a dedicated domain.
+When a request to the public URL fails, follow this strict diagnostic order to pinpoint the exact failure layer:
+
+1. **Step 1: Check Local `/v1/models`**
+   ```bash
+   curl -s http://127.0.0.1:8000/v1/models
+   ```
+   _If this fails_: vLLM server crashed or is still loading. Check `/kaggle/working/vllm_server.log`.
+2. **Step 2: Check Local Inference**
+   ```bash
+   ./infra/kaggle/qwen-vllm.sh test
+   ```
+   _If this fails_: vLLM engine error or out of memory during token generation.
+3. **Step 3: Check Cloudflare Process Status**
+   ```bash
+   ./infra/kaggle/cloudflared.sh status
+   ```
+   _If this fails_: `cloudflared` process died. Restart via `./infra/kaggle/cloudflared.sh start`.
+4. **Step 4: Check Cloudflare Tunnel Logs**
+   ```bash
+   ./infra/kaggle/cloudflared.sh logs 30
+   ```
+   _If this shows errors_: Network disconnection or rate limiting on Quick Tunnel edges.
+5. **Step 5: Check Public `/v1/models`**
+   ```bash
+   curl -s https://<dynamic-subdomain>.trycloudflare.com/v1/models
+   ```
+   _If this fails_: DNS propagation delay or Cloudflare edge connection issue.
+6. **Step 6: Check Public Inference**
+   ```bash
+   curl -X POST https://<dynamic-subdomain>.trycloudflare.com/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model": "qwen3-coder-30b", "messages": [{"role": "user", "content": "PONG"}]}'
+   ```
+   _If this succeeds_: The backend and tunnel are fully verified. Configure Relay locally!

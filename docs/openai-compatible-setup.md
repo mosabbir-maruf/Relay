@@ -29,8 +29,7 @@ vLLM provides high-throughput, low-latency LLM serving with native PagedAttentio
 Run vLLM on your GPU machine:
 
 ```bash
-python3 -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-Coder-7B-Instruct \
+vllm serve Qwen/Qwen2.5-Coder-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --trust-remote-code \
@@ -41,8 +40,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 If you require authentication on the vLLM server, add `--api-key <secret>`:
 
 ```bash
-python3 -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-Coder-7B-Instruct \
+vllm serve Qwen/Qwen2.5-Coder-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --api-key my-vllm-secret-key
