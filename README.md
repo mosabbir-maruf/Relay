@@ -186,7 +186,7 @@ pnpm build
 
 ## Self-Hosted Qwen on Kaggle
 
-Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3B-Instruct** via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs (such as Kaggle's free GPU tier) and exposing it securely to Relay over an encrypted Cloudflare Quick Tunnel.
+Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3B-Instruct** via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs in Kaggle and exposing it securely to Relay over an encrypted Cloudflare Quick Tunnel.
 
 - **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md)
 - **Executable Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb)
@@ -194,7 +194,7 @@ Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3
 - **Gateway Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your `.env`.
 
 > [!NOTE]
-> Kaggle provides an ephemeral development and integration testing environment (sessions run up to 9–12 hours). It is intended for development and evaluation, not persistent production infrastructure.
+> Kaggle provides an ephemeral development and integration testing environment. Sessions are temporary and may terminate based on Kaggle runtime limits or inactivity. It is intended for development and evaluation, not persistent production infrastructure.
 
 ---
 
