@@ -1,0 +1,30 @@
+{
+  "name": "@relay/providers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Provider adapters (Gemini, OpenAI-compatible, vLLM/Qwen) and model routing for Relay.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@relay/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
