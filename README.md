@@ -2,7 +2,7 @@
 
 > **One interface. Any model.**
 
-Relay is a high-performance, provider-agnostic LLM gateway and control plane built with Node.js, TypeScript, and Fastify. It exposes a unified, standard OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`) and routes requests to heterogeneous upstream model backends—including Google Gemini, self-hosted vLLM servers (e.g., Qwen3-Coder), and arbitrary OpenAI-compatible endpoints.
+Relay is a provider-agnostic LLM gateway and control plane built with Node.js, TypeScript, and Fastify. It exposes a unified, standard OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`) and routes requests to heterogeneous upstream model backends—including Google Gemini, self-hosted vLLM servers (e.g., Qwen3-Coder), and configured OpenAI-compatible endpoints.
 
 > [!NOTE]
 > **Gateway, Not a Model**: Relay is not an LLM and does not train or host models internally. All inference runs inside your configured upstream providers or self-hosted GPU clusters. Relay serves as the resilience, routing, security, and observability layer sitting between your client applications and upstream inference engines.
@@ -28,10 +28,10 @@ Relay is a high-performance, provider-agnostic LLM gateway and control plane bui
 
 ## Why Relay?
 
-- **Eliminate Provider Lock-in**: Decouple client applications from specific vendor SDKs. Switch between hosted cloud APIs (Gemini) and self-hosted open-weights models (Qwen, Llama on vLLM) with configuration changes alone.
-- **Failover & High Availability**: Automatically retry transient upstream errors against secondary fallback models without failing client requests.
-- **Circuit Breaker Protection**: Detect and isolate consistently failing providers to eliminate latency spikes and stop hammering downed backends.
-- **Centralized Governance & Security**: Enforce Bearer token authentication, process-local rate limiting, SSRF safeguards, payload size limits, and zero credential leakage in a single control plane.
+- **Eliminate Provider Lock-in**: Decouple client applications from specific vendor SDKs. Switch between hosted cloud APIs (Gemini) and self-hosted open-weights models (Qwen on vLLM) with configuration changes alone.
+- **Failover & Resilience**: Automatically retry transient upstream errors against secondary fallback models without failing client requests.
+- **Circuit Breaker Protection**: Detect and isolate consistently failing providers to avoid latency spikes and stop hammering downed backends.
+- **Centralized Governance & Security**: Enforce optional Bearer token authentication, process-local rate limiting, SSRF safeguards, payload size limits, and credential leakage prevention in a single control plane.
 - **Unified Telemetry**: Capture normalized request durations, token counts, error categories, and attempt counts across all providers.
 
 ---
@@ -44,9 +44,9 @@ Relay is a high-performance, provider-agnostic LLM gateway and control plane bui
   - `GET /v1/models/:model` for single-model inspection.
   - `GET /health` with cached upstream connectivity probes (`?refresh=true` supported).
 - **Supported Provider Integrations**:
-  - **Google Gemini**: Native adapter supporting Gemini 2.5 Flash, Gemini 2.5 Pro, and latest models with vision, structured outputs, and function calling.
-  - **Qwen3-Coder via vLLM**: Verified first-class configuration for self-hosted `qwen3-coder-30b`.
-  - **OpenAI-Compatible Backends**: Generic adapter compatible with vLLM, Ollama, LM Studio, Groq, Together, DeepSeek, and OpenAI.
+  - **Google Gemini**: Native adapter supporting configured Gemini models (such as `gemini-2.5-flash` and `gemini-2.5-pro`) and features supported by the provider contract (streaming, tool calling, vision, structured outputs).
+  - **Qwen3-Coder via vLLM**: Verified first-class configuration for self-hosted `qwen3-coder-30b` running on dual NVIDIA Tesla T4 GPUs.
+  - **OpenAI-Compatible Backends**: Generic adapter compatible with configured OpenAI-compatible endpoints (designed to work with vLLM, Ollama, LM Studio, Groq, Together, DeepSeek, and OpenAI).
   - **Extensible Multi-Provider JSON**: Add arbitrary additional backends dynamically via `ADDITIONAL_PROVIDERS` without touching gateway code.
 - **Collision-Safe Model Routing**:
   - **Exact Bare IDs**: Route unambiguous model names directly (e.g. `gemini-2.5-flash`).
@@ -136,9 +136,9 @@ cp .env.example .env
 Edit `.env` with your provider keys or local inference endpoints:
 
 ```dotenv
-# Port and Server
+# Port and Server (bind to loopback for local development)
 PORT=3000
-HOST=0.0.0.0
+HOST=127.0.0.1
 LOG_LEVEL=info
 
 # Gateway Authentication (optional, leave blank for local development)
@@ -152,6 +152,9 @@ QWEN_BASE_URL=http://localhost:8000/v1
 QWEN_MODEL=qwen3-coder-30b
 ```
 
+> [!TIP]
+> For local development, `HOST=127.0.0.1` binds Relay strictly to the loopback interface, and `RELAY_API_KEY` can be left unset. In production deployments exposed over a network, configure `HOST=0.0.0.0`, enforce `RELAY_API_KEY`, and place Relay behind a TLS-terminating reverse proxy or private network boundary.
+
 ### 3. Run Development Server
 
 ```bash
@@ -163,7 +166,7 @@ The gateway will start at `http://localhost:3000`.
 ### 4. Run Test Suite & Build
 
 ```bash
-# Run all unit and integration tests (175 tests)
+# Run the test suite
 pnpm test
 
 # Check code formatting
@@ -181,6 +184,20 @@ pnpm build
 
 ---
 
+## Self-Hosted Qwen on Kaggle
+
+Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3B-Instruct** via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs (such as Kaggle's free GPU tier) and exposing it securely to Relay over an encrypted Cloudflare Quick Tunnel.
+
+- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md)
+- **Executable Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb)
+- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
+- **Gateway Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your `.env`.
+
+> [!NOTE]
+> Kaggle provides an ephemeral development and integration testing environment (sessions run up to 9–12 hours). It is intended for development and evaluation, not persistent production infrastructure.
+
+---
+
 ## Environment Configuration
 
 Configuration is validated at startup using Zod. The primary configuration options in `.env` are:
@@ -188,10 +205,10 @@ Configuration is validated at startup using Zod. The primary configuration optio
 | Variable                            |   Type    |                   Default                   | Description                                                                       |
 | :---------------------------------- | :-------: | :-----------------------------------------: | :-------------------------------------------------------------------------------- |
 | `PORT`                              | `number`  |                   `3000`                    | HTTP port for the Fastify server.                                                 |
-| `HOST`                              | `string`  |                  `0.0.0.0`                  | Network binding interface.                                                        |
+| `HOST`                              | `string`  |                  `0.0.0.0`                  | Network binding interface (`127.0.0.1` recommended for local development).        |
 | `LOG_LEVEL`                         | `string`  |                   `info`                    | Logging verbosity (`fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`). |
 | `REQUEST_TIMEOUT_MS`                | `number`  |                   `60000`                   | Global request deadline in milliseconds.                                          |
-| `RELAY_API_KEY`                     | `string`  |                   _empty_                   | If set, all `/v1/*` endpoints require `Authorization: Bearer <token>`.            |
+| `RELAY_API_KEY`                     | `string`  |                   _empty_                   | Optional static Bearer token. When set, all `/v1/*` endpoints require auth.       |
 | `GEMINI_API_KEY`                    | `string`  |                   _empty_                   | Google Gemini API key. Activates the Gemini provider when set.                    |
 | `GEMINI_BASE_URL`                   | `string`  | `https://generativelanguage.googleapis.com` | Gemini API root URL.                                                              |
 | `GEMINI_MODELS`                     | `string`  |           `gemini-2.5-flash,...`            | Comma-separated model IDs to register under Gemini.                               |
@@ -202,10 +219,10 @@ Configuration is validated at startup using Zod. The primary configuration optio
 | `OPENAI_COMPATIBLE_MODELS`          | `string`  |                   _empty_                   | Comma-separated list of models available on the generic backend.                  |
 | `ADDITIONAL_PROVIDERS`              | `string`  |                   _empty_                   | JSON array of extra OpenAI-compatible backends.                                   |
 | `ROUTING_POLICIES`                  | `string`  |                   _empty_                   | JSON array of logical aliases and fallback chains.                                |
-| `RATE_LIMIT_ENABLED`                | `boolean` |                   `false`                   | Enable or disable process-local rate limiting.                                    |
-| `RATE_LIMIT_MAX_REQUESTS`           | `number`  |                    `100`                    | Max requests per key per window.                                                  |
-| `RATE_LIMIT_WINDOW_MS`              | `number`  |                   `60000`                   | Rate limit window in milliseconds (1 minute).                                     |
-| `CIRCUIT_BREAKER_ENABLED`           | `boolean` |                   `false`                   | Enable or disable upstream circuit breaking.                                      |
+| `RATE_LIMIT_ENABLED`                | `boolean` |                   `false`                   | Enable or disable process-local in-memory rate limiting.                          |
+| `RATE_LIMIT_MAX_REQUESTS`           | `number`  |                    `100`                    | Max requests per key per window (process-local).                                  |
+| `RATE_LIMIT_WINDOW_MS`              | `number`  |                   `60000`                   | Rate limit fixed window in milliseconds (1 minute).                               |
+| `CIRCUIT_BREAKER_ENABLED`           | `boolean` |                   `false`                   | Enable or disable process-local upstream circuit breaking.                        |
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `number`  |                     `5`                     | Consecutive failures before tripping a provider circuit to `open`.                |
 | `CIRCUIT_BREAKER_RESET_TIMEOUT_MS`  | `number`  |                   `30000`                   | Cooldown period before probing a failing provider in `half_open` state.           |
 
@@ -221,7 +238,7 @@ All examples assume Relay is running on `http://localhost:3000`.
 curl -X GET http://localhost:3000/health
 ```
 
-**Response**:
+**Example response (illustrative):**
 
 ```json
 {
@@ -248,7 +265,7 @@ curl -X GET http://localhost:3000/health
 curl -X GET http://localhost:3000/v1/models
 ```
 
-**Response**:
+**Example response (illustrative):**
 
 ```json
 {
@@ -286,6 +303,9 @@ curl -X GET http://localhost:3000/v1/models
 }
 ```
 
+> [!NOTE]
+> The capability metadata reflects the model/backend capability contract (for example, `maxContextTokens: 32768` for Qwen3-Coder-30B), while runtime deployments may constrain the context window further (such as the verified Kaggle/vLLM configuration using `--max-model-len 4096`).
+
 ### 3. Non-Streaming Chat Completion
 
 ```bash
@@ -301,7 +321,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-**Response**:
+**Example response (illustrative):**
 
 ```json
 {
@@ -341,7 +361,7 @@ curl -N -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-**SSE Stream Output**:
+**Example SSE stream output (illustrative):**
 
 ```text
 data: {"id":"chatcmpl-stream-1","object":"chat.completion.chunk","created":1726500000,"model":"qwen3-coder-30b","choices":[{"index":0,"delta":{"role":"assistant","content":"function"},"finish_reason":null}]}
@@ -382,18 +402,6 @@ When a client sends:
 4. If `qwen` is already `open` due to prior consecutive failures, Relay skips `qwen` entirely and routes directly to Gemini.
 
 See [docs/routing-and-fallbacks.md](docs/routing-and-fallbacks.md) for full configuration details.
-
----
-
-## Self-hosted Qwen / vLLM on Kaggle
-
-Relay includes first-class support for self-hosted Qwen models running through vLLM on dual NVIDIA Tesla T4 GPUs (such as Kaggle's free GPU tier).
-
-- **Canonical Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md)
-- **Executable Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb)
-- **Infrastructure Scripts**: [infra/kaggle/](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
-- **Verified Serving**: `vllm serve QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ --served-model-name qwen3-coder-30b`
-- **Relay Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your local `.env`.
 
 ---
 
