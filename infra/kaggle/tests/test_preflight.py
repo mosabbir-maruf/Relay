@@ -404,6 +404,115 @@ for a in data.get('command_args', []):
         self.assertIn("FIRST_ARG:vllm", output)
         self.assertIn("SECOND_ARG:serve", output)
 
+    def test_glm_ocr_multimodal_classification(self):
+        """Validates that GlmOcrForConditionalGeneration is classified as multimodal with image modality."""
+        kind, modalities = preflight.classify_model_capabilities(
+            ["GlmOcrForConditionalGeneration"], "glm_ocr", {}
+        )
+        self.assertEqual(kind, "multimodal_causal_lm")
+        self.assertEqual(modalities, ["text", "image"])
+
+    def test_glm_ocr_nested_config_and_dtype_resolution(self):
+        """Validates parsing of GLM-OCR nested text_config and safe T4 float16 resolution."""
+        model_info = {
+            "id": "zai-org/GLM-OCR",
+            "tags": ["image-text-to-text", "ocr"],
+        }
+        config = {
+            "architectures": ["GlmOcrForConditionalGeneration"],
+            "model_type": "glm_ocr",
+            "text_config": {
+                "max_position_embeddings": 131072,
+                "dtype": "bfloat16",
+            },
+            "vision_config": {
+                "image_size": 336,
+            },
+            "num_parameters": 900_000_000,
+        }
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        self.assertEqual(attrs["model_kind"], "multimodal_causal_lm")
+        self.assertEqual(attrs["modalities"], ["text", "image"])
+        self.assertEqual(attrs["context_length"], 131072)
+        self.assertEqual(attrs["torch_dtype"], "bfloat16")
+        self.assertEqual(attrs["param_count"], 900_000_000)
+
+        # Validate dual T4 compatibility
+        errors = preflight.validate_compatibility(
+            "zai-org/GLM-OCR", attrs, self.mock_t4_gpu, {}
+        )
+        self.assertEqual(len(errors), 0)
+
+        # Validate configuration resolution: on T4, bfloat16 must be coerced to float16
+        resolved = preflight.resolve_configuration("zai-org/GLM-OCR", attrs, {})
+        self.assertEqual(resolved["status"], "PASS")
+        self.assertEqual(resolved["dtype"], "float16")
+        self.assertEqual(resolved["served_model_name"], "glm-ocr")
+        self.assertEqual(resolved["model_kind"], "multimodal_causal_lm")
+        self.assertEqual(resolved["modalities"], ["text", "image"])
+        self.assertEqual(resolved["max_model_len"], 4096)
+        self.assertIn("--served-model-name glm-ocr", resolved["command_str"])
+        self.assertIn("--dtype float16", resolved["command_str"])
+
+    def test_extra_vllm_args_string_and_list(self):
+        """Tests that user-supplied extra vLLM flags are safely appended to argv array."""
+        attrs = {
+            "architectures": ["GlmOcrForConditionalGeneration"],
+            "model_kind": "multimodal_causal_lm",
+            "modalities": ["text", "image"],
+        }
+        # 1. As string
+        user_overrides_str = {
+            "extra_vllm_args": "--limit-mm-per-prompt image=1 --trust-remote-code"
+        }
+        res_str = preflight.resolve_configuration(
+            "zai-org/GLM-OCR", attrs, user_overrides_str
+        )
+        self.assertEqual(
+            res_str["extra_vllm_args"],
+            ["--limit-mm-per-prompt", "image=1", "--trust-remote-code"],
+        )
+        self.assertIn("--limit-mm-per-prompt", res_str["command_args"])
+        self.assertIn("image=1", res_str["command_args"])
+
+        # 2. As list
+        user_overrides_list = {
+            "extra_vllm_args": ["--limit-mm-per-prompt", "image=2"]
+        }
+        res_list = preflight.resolve_configuration(
+            "zai-org/GLM-OCR", attrs, user_overrides_list
+        )
+        self.assertEqual(
+            res_list["extra_vllm_args"],
+            ["--limit-mm-per-prompt", "image=2"],
+        )
+        self.assertIn("image=2", res_list["command_args"])
+
+    def test_multimodal_context_length_minimum(self):
+        """Validates that multimodal models require at least 512 context tokens."""
+        attrs = {
+            "architectures": ["GlmOcrForConditionalGeneration"],
+            "model_kind": "multimodal_causal_lm",
+            "modalities": ["text", "image"],
+            "param_count": 900_000_000,
+        }
+        # max_model_len=256 is invalid for multimodal
+        errors = preflight.validate_compatibility(
+            "zai-org/GLM-OCR", attrs, self.mock_t4_gpu, {"max_model_len": 256}
+        )
+        self.assertTrue(any("Must be >= 512" in e for e in errors))
+
+    def test_deterministic_test_image_generation(self):
+        """Validates test_image.py generates valid PNG and base64 data URI without dependencies."""
+        import test_image
+        png_data = test_image.generate_test_png("RELAY TEST")
+        self.assertTrue(png_data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(len(png_data) > 100)
+
+        data_uri = test_image.generate_test_data_uri("RELAY TEST")
+        self.assertTrue(data_uri.startswith("data:image/png;base64,"))
+        self.assertTrue(len(data_uri) > 150)
+
 
 if __name__ == "__main__":
     unittest.main()

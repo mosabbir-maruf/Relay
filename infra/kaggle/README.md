@@ -14,7 +14,8 @@ Two deployment workflows are supported:
 | Script               | Purpose                                                                                         | Key Subcommands                                                              |
 | :------------------- | :---------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------- |
 | **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.        | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop` |
-| **`preflight.py`**   | Hugging Face Hub inspector and hardware compatibility validator (standard library Python 3.8+). | `--model-id`, `--json`, `--tensor-parallel-size`, `--hf-token`               |
+| **`preflight.py`**   | Hugging Face Hub inspector and hardware compatibility validator (standard library Python 3.8+). | `--model-id`, `--json`, `--tensor-parallel-size`, `--hf-token`, `--extra-vllm-args` |
+| **`test_image.py`**  | Pure standard library PNG generator and base64 data URI encoder for multimodal OCR smoke tests. | `[text]` (prints `data:image/png;base64,...`)                                |
 | **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                            | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`              |
 | **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.  | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                        |
 | **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.        | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                    |
@@ -91,13 +92,17 @@ Expected output:
 
 ## Workflow 1: Generic Hugging Face Model Deployment
 
-The generic workflow allows you to deploy any compatible causal language model simply by setting `MODEL_ID`:
+The generic workflow allows you to deploy any compatible causal language model or multimodal vision/OCR model simply by setting `MODEL_ID`:
 
 ```bash
 %%bash
 cd /kaggle/working/Relay
 export MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
 export SERVED_MODEL_NAME="qwen2.5-coder-7b"
+
+# To deploy GLM-OCR instead:
+# export MODEL_ID="zai-org/GLM-OCR"
+# export SERVED_MODEL_NAME="glm-ocr"
 
 # 1. Preflight validation
 ./infra/kaggle/vllm.sh preflight
@@ -111,7 +116,7 @@ export SERVED_MODEL_NAME="qwen2.5-coder-7b"
 # 4. Check readiness
 ./infra/kaggle/vllm.sh status
 
-# 5. Smoke test local inference
+# 5. Smoke test local inference (automatically sends OCR image prompt for multimodal models)
 ./infra/kaggle/vllm.sh test
 
 # 6. Expose over Cloudflare Quick Tunnel
@@ -122,9 +127,9 @@ export SERVED_MODEL_NAME="qwen2.5-coder-7b"
 
 The preflight validator (`preflight.py`) inspects model metadata via the official Hugging Face Hub API and validates:
 
-- **Architecture Support**: Rejects non-causal LM architectures (encoder-only, classification, diffusion, audio).
+- **Architecture Support**: Validates causal text models (`Qwen2ForCausalLM`, `LlamaForCausalLM`, `MistralForCausalLM`, etc.) and multimodal generative models (`GlmOcrForConditionalGeneration`, `Qwen2VLForConditionalGeneration`, etc.). Rejects encoder-only, audio, classification, and diffusion architectures.
 - **T4 Hardware Precision**: Enforces `float16` by default. Rejects FP8 models because Tesla T4 (Turing CC 7.5) lacks FP8 tensor cores.
-- **VRAM Heuristic**: Estimates total parameter footprint against dual Tesla T4 capacity (~30 GB usable VRAM). Rejects unquantized models > 14B and 4-bit models > 32B with actionable guidance.
+- **VRAM Heuristic**: Estimates total parameter footprint including vision encoder overhead against dual Tesla T4 capacity (~30 GB usable VRAM). Rejects unquantized models > 14B and 4-bit models > 32B with actionable guidance.
 - **Gated Models**: Checks whether model repository is gated/private and verifies that `HF_TOKEN` is present without logging raw secrets.
 
 ---

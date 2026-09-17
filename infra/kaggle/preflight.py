@@ -74,6 +74,87 @@ SUPPORTED_CAUSAL_PATTERNS = [
     r"decilm.*",
 ]
 
+# Supported multimodal generative architecture patterns
+SUPPORTED_MULTIMODAL_ARCH_PATTERNS = [
+    r".*glmocr.*",
+    r"glm_ocr.*",
+    r".*qwen2(_5)?_?vl.*",
+    r".*llava.*",
+    r".*paligemma.*",
+    r".*mllama.*",
+    r".*chameleon.*",
+]
+
+SUPPORTED_MULTIMODAL_MODEL_TYPES = {
+    "glm_ocr",
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "llava",
+    "llava_next",
+    "paligemma",
+    "mllama",
+    "chameleon",
+}
+
+
+def classify_model_capabilities(
+    architectures: List[str],
+    model_type: str,
+    config: Dict[str, Any],
+) -> Tuple[str, List[str]]:
+    """
+    Classifies model into (model_kind, modalities).
+    Returns:
+      model_kind: 'text_causal_lm' | 'multimodal_causal_lm' | 'unsupported'
+      modalities: ['text'] | ['text', 'image'] | []
+    """
+    archs_lower = [a.lower() for a in architectures]
+    mt_lower = (model_type or "").lower()
+
+    # 1. Check if explicitly unsupported
+    for arch in archs_lower:
+        if any(re.match(pat, arch) for pat in UNSUPPORTED_ARCH_PATTERNS):
+            return "unsupported", []
+
+    # 2. Check if known supported multimodal architecture
+    is_multimodal = False
+    for arch in archs_lower:
+        if any(re.match(pat, arch) for pat in SUPPORTED_MULTIMODAL_ARCH_PATTERNS):
+            is_multimodal = True
+            break
+
+    if not is_multimodal and mt_lower in SUPPORTED_MULTIMODAL_MODEL_TYPES:
+        is_multimodal = True
+
+    if not is_multimodal:
+        # Check if vision configuration or image tokens are present alongside generative architecture
+        has_vision = bool(config.get("vision_config") or config.get("image_token_id"))
+        has_conditional_gen = any(
+            re.match(r".*forconditionalgeneration$", arch) for arch in archs_lower
+        )
+        if has_vision and (has_conditional_gen or "ocr" in mt_lower or "vl" in mt_lower):
+            is_multimodal = True
+
+    if is_multimodal:
+        return "multimodal_causal_lm", ["text", "image"]
+
+    # 3. Check if supported text causal LM
+    is_causal = False
+    for arch in archs_lower:
+        if any(re.match(pat, arch) for pat in SUPPORTED_CAUSAL_PATTERNS):
+            is_causal = True
+            break
+
+    if not is_causal and mt_lower:
+        if any(re.match(pat, mt_lower) for pat in SUPPORTED_CAUSAL_PATTERNS):
+            is_causal = True
+
+    if is_causal:
+        return "text_causal_lm", ["text"]
+
+    return "unsupported", []
+
+
 
 def mask_token(token: Optional[str]) -> str:
     """Masks authentication token for safe logging."""
@@ -197,6 +278,7 @@ def inspect_model_attributes(
 ) -> Dict[str, Any]:
     """Extracts architecture, quantization, context, and size attributes."""
     attrs: Dict[str, Any] = {}
+    attrs["raw_config"] = config
 
     # Architectures
     architectures = config.get("architectures") or []
@@ -205,17 +287,35 @@ def inspect_model_attributes(
     attrs["architectures"] = architectures
     attrs["model_type"] = config.get("model_type", "")
 
-    # Context length
+    # Capability classification (text vs multimodal vs unsupported)
+    model_kind, modalities = classify_model_capabilities(
+        architectures, attrs["model_type"], config
+    )
+    attrs["model_kind"] = model_kind
+    attrs["modalities"] = modalities
+
+    # Context length (check root config and nested text_config for VL/OCR models)
     ctx = (
         config.get("max_position_embeddings")
         or config.get("seq_length")
         or config.get("max_sequence_length")
         or config.get("n_positions")
     )
+    if not ctx and isinstance(config.get("text_config"), dict):
+        text_cfg = config["text_config"]
+        ctx = (
+            text_cfg.get("max_position_embeddings")
+            or text_cfg.get("seq_length")
+            or text_cfg.get("max_sequence_length")
+            or text_cfg.get("n_positions")
+        )
     attrs["context_length"] = int(ctx) if ctx and str(ctx).isdigit() else None
 
     # Native torch dtype
-    attrs["torch_dtype"] = config.get("torch_dtype")
+    torch_dtype = config.get("torch_dtype")
+    if not torch_dtype and isinstance(config.get("text_config"), dict):
+        torch_dtype = config["text_config"].get("dtype")
+    attrs["torch_dtype"] = torch_dtype
 
     # Quantization detection
     quant_cfg = config.get("quantization_config") or {}
@@ -254,7 +354,7 @@ def inspect_model_attributes(
             param_count = int(n_params)
 
     if param_count is None:
-        # Heuristic extraction from model ID (e.g. 7b, 30b, 0.5b)
+        # Heuristic extraction from model ID (e.g. 7b, 30b, 0.5b, 0.9b)
         m = re.search(r"[-_]([0-9]+(?:\.[0-9]+)?)[bB][-_]?", model_info.get("id", ""))
         if m:
             try:
@@ -293,49 +393,40 @@ def validate_compatibility(
     )
     param_count = attrs.get("param_count")
 
-    # 1. Architecture Validation
-    has_unsupported = False
-    for arch in archs:
-        arch_lower = arch.lower()
-        if any(re.match(pat, arch_lower) for pat in UNSUPPORTED_ARCH_PATTERNS):
-            has_unsupported = True
-            break
-
-    if has_unsupported:
-        errors.append(
-            f"Architecture '{archs}' is not a supported causal language model for vLLM text generation. "
-            "Encoder-only, classification, diffusion, vision, and non-text architectures cannot be served."
+    # 1. Architecture & Capability Validation
+    model_kind = attrs.get("model_kind")
+    if not model_kind:
+        model_kind, _ = classify_model_capabilities(
+            archs, model_type, attrs.get("raw_config") or {}
         )
-    else:
-        # Check against known supported causal LM architectures
-        has_supported = False
+
+    if model_kind == "unsupported":
+        has_unsupported = False
         for arch in archs:
-            arch_lower = arch.lower()
-            if any(re.match(pat, arch_lower) for pat in SUPPORTED_CAUSAL_PATTERNS):
-                has_supported = True
+            if any(re.match(pat, arch.lower()) for pat in UNSUPPORTED_ARCH_PATTERNS):
+                has_unsupported = True
                 break
 
-        # Fall back to checking model_type against supported patterns
-        if not has_supported and model_type:
-            if any(re.match(pat, model_type) for pat in SUPPORTED_CAUSAL_PATTERNS):
-                has_supported = True
-
-        if not has_supported:
-            if archs:
-                errors.append(
-                    f"Architecture '{archs}' is unrecognized. Unable to verify causal LM compatibility "
-                    "with vLLM. To prevent silent deployment failures, automatic preflight fails closed. "
-                    "Verify this model is a supported autoregressive causal language model."
-                )
-            elif not model_type:
-                errors.append(
-                    f"Model '{model_id}' does not specify architectures or model_type in config.json. "
-                    "Unable to verify causal LM compatibility with vLLM."
-                )
-            else:
-                errors.append(
-                    f"Model type '{model_type}' is unrecognized. Unable to verify causal LM compatibility with vLLM."
-                )
+        if has_unsupported:
+            errors.append(
+                f"Architecture '{archs}' is not a supported causal language model or multimodal generative model for vLLM. "
+                "Encoder-only, audio, classification, diffusion, and non-generative architectures cannot be served."
+            )
+        elif archs:
+            errors.append(
+                f"Architecture '{archs}' is unrecognized. Unable to verify causal LM compatibility or multimodal compatibility "
+                "with vLLM. To prevent silent deployment failures, automatic preflight fails closed. "
+                "Verify this model is a supported autoregressive causal language or vision-language model."
+            )
+        elif not model_type:
+            errors.append(
+                f"Model '{model_id}' does not specify architectures or model_type in config.json. "
+                "Unable to verify compatibility with vLLM."
+            )
+        else:
+            errors.append(
+                f"Model type '{model_type}' is unrecognized. Unable to verify compatibility with vLLM."
+            )
 
     # 2. Hardware: FP8 Quantization on Tesla T4
     if quant_method == "fp8":
@@ -360,20 +451,22 @@ def validate_compatibility(
     # 4. Hardware: VRAM Footprint Estimation (Heuristic Safety Policy)
     if param_count and param_count > 0:
         params_billions = param_count / 1_000_000_000.0
+        # Multimodal models have visual encoder overhead (~1.0 GB)
+        mm_overhead = 1.0 if model_kind == "multimodal_causal_lm" else 0.0
 
         if not quant_method:
-            # Unquantized 16-bit (~2.0 bytes per parameter)
-            est_vram_gb = params_billions * 2.0
+            # Unquantized 16-bit (~2.0 bytes per parameter) + multimodal encoder
+            est_vram_gb = params_billions * 2.0 + mm_overhead
             if est_vram_gb > DUAL_T4_TOTAL_VRAM_GB:
                 errors.append(
                     f"Model parameter count (~{params_billions:.1f}B) in unquantized 16-bit requires "
-                    f"~{est_vram_gb:.1f} GB VRAM for weights alone, which exceeds the total usable VRAM "
+                    f"~{est_vram_gb:.1f} GB VRAM for weights and vision encoder, which exceeds the total usable VRAM "
                     f"of Kaggle dual Tesla T4s (~{DUAL_T4_TOTAL_VRAM_GB:.1f} GB). "
                     "Remediation: Choose an AWQ or GPTQ 4-bit quantized version of this model."
                 )
         elif quant_method in ("awq", "gptq"):
-            # 4-bit quantization (~0.55-0.65 bytes per parameter)
-            est_vram_gb = params_billions * 0.6
+            # 4-bit quantization (~0.55-0.65 bytes per parameter) + multimodal encoder
+            est_vram_gb = params_billions * 0.6 + mm_overhead
             if est_vram_gb > (DUAL_T4_TOTAL_VRAM_GB * 0.85):
                 errors.append(
                     f"Quantized 4-bit model (~{params_billions:.1f}B parameters) requires estimated "
@@ -385,8 +478,12 @@ def validate_compatibility(
     max_len = user_overrides.get("max_model_len")
     if max_len is None:
         max_len = DEFAULT_MAX_MODEL_LEN
-    if max_len < 128:
-        errors.append(f"Invalid max_model_len ({max_len}). Must be >= 128.")
+    min_allowed_len = 512 if model_kind == "multimodal_causal_lm" else 128
+    if max_len < min_allowed_len:
+        errors.append(
+            f"Invalid max_model_len ({max_len}). Must be >= {min_allowed_len} "
+            f"({'multimodal models require sequence budget for visual image tokens and text prompt' if model_kind == 'multimodal_causal_lm' else 'minimum required length'})."
+        )
 
     return errors
 
@@ -400,6 +497,9 @@ def resolve_configuration(
     Resolves final vLLM execution arguments using precedence:
       User Overrides -> Model Metadata -> Safe Defaults
     """
+    model_kind = attrs.get("model_kind", "text_causal_lm")
+    modalities = attrs.get("modalities", ["text"])
+
     # Served model name
     served_name = (
         user_overrides.get("served_model_name")
@@ -452,6 +552,16 @@ def resolve_configuration(
     if trust_remote is None:
         trust_remote = bool(attrs.get("requires_remote_code", False))
 
+    # Parse extra_vllm_args if provided
+    extra_args_input = user_overrides.get("extra_vllm_args")
+    extra_args: List[str] = []
+    if extra_args_input:
+        if isinstance(extra_args_input, list):
+            extra_args = [str(a) for a in extra_args_input]
+        elif isinstance(extra_args_input, str) and extra_args_input.strip():
+            import shlex
+            extra_args = shlex.split(extra_args_input.strip())
+
     # Build exact vllm CLI arguments
     cmd_args: List[str] = [
         "vllm",
@@ -484,9 +594,14 @@ def resolve_configuration(
     if trust_remote:
         cmd_args.append("--trust-remote-code")
 
+    if extra_args:
+        cmd_args.extend(extra_args)
+
     return {
         "status": "PASS",
         "model_id": model_id,
+        "model_kind": model_kind,
+        "modalities": modalities,
         "served_model_name": served_name,
         "tensor_parallel_size": tp,
         "dtype": dtype,
@@ -496,6 +611,7 @@ def resolve_configuration(
         "gpu_memory_utilization": gpu_mem,
         "enforce_eager": enforce_eager,
         "trust_remote_code": trust_remote,
+        "extra_vllm_args": extra_args,
         "host": DEFAULT_HOST,
         "port": DEFAULT_PORT,
         "command_args": cmd_args,
@@ -518,6 +634,8 @@ def print_diagnostic_report(
 
     p(" [1] Target Hugging Face Model\n")
     p(f"     Model ID:          {model_id}\n")
+    p(f"     Model Kind:        {attrs.get('model_kind') or 'text_causal_lm'}\n")
+    p(f"     Modalities:        {', '.join(attrs.get('modalities') or ['text'])}\n")
     p(f"     Architectures:     {attrs.get('architectures') or '<not specified>'}\n")
     p(f"     Model Type:        {attrs.get('model_type') or '<unknown>'}\n")
     param_str = (
@@ -544,6 +662,8 @@ def print_diagnostic_report(
 
     p(" [3] Resolved vLLM Configuration\n")
     p(f"     Served Alias:      {resolved['served_model_name']}\n")
+    p(f"     Model Kind:        {resolved.get('model_kind')}\n")
+    p(f"     Modalities:        {', '.join(resolved.get('modalities') or [])}\n")
     p(f"     Tensor Parallel:   {resolved['tensor_parallel_size']}\n")
     p(f"     Execution DType:   {resolved['dtype']} (Safe for Turing CC 7.5)\n")
     p(f"     Quantization:      {resolved['quantization'] or 'None'}\n")
@@ -551,7 +671,9 @@ def print_diagnostic_report(
     p(f"     Max Num Seqs:      {resolved['max_num_seqs']}\n")
     p(f"     GPU Memory Util:   {resolved['gpu_memory_utilization']}\n")
     p(f"     Enforce Eager:     {resolved['enforce_eager']}\n")
-    p(f"     Trust Remote Code: {resolved['trust_remote_code']}\n\n")
+    p(f"     Trust Remote Code: {resolved['trust_remote_code']}\n")
+    extra_str = " ".join(resolved.get("extra_vllm_args") or [])
+    p(f"     Extra vLLM Args:   {extra_str if extra_str else 'None'}\n\n")
 
     p(" [4] Generated vLLM Execution Command\n")
     p(f"     {resolved['command_str']}\n")
@@ -614,6 +736,11 @@ def parse_args() -> argparse.Namespace:
         help="Whether to pass --trust-remote-code (true/false)",
     )
     parser.add_argument(
+        "--extra-vllm-args",
+        default=os.environ.get("EXTRA_VLLM_ARGS"),
+        help="Additional CLI flags to append to vllm serve",
+    )
+    parser.add_argument(
         "--hf-token",
         default=os.environ.get("HF_TOKEN"),
         help="Hugging Face access token for gated models",
@@ -649,6 +776,7 @@ def main() -> None:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "dtype": args.dtype,
         "quantization": args.quantization,
+        "extra_vllm_args": args.extra_vllm_args,
     }
 
     if args.trust_remote_code is not None:

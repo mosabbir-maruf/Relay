@@ -282,10 +282,56 @@ test_inference() {
   fi
 
   echo "Target Model Alias: ${target_model}"
-  echo "Sending test inference request to http://127.0.0.1:${PORT}/v1/chat/completions..."
+
+  # Capability detection (text vs multimodal)
+  local model_kind="${MODEL_KIND:-}"
+  if [ -z "${model_kind}" ] && [ -n "${MODEL_ID:-}" ]; then
+    model_kind=$(python3 -c "
+import sys, os
+sys.path.insert(0, '${SCRIPT_DIR}')
+try:
+    import preflight
+    info, cfg = preflight.fetch_hf_model_metadata('${MODEL_ID}', os.environ.get('HF_TOKEN'))
+    attrs = preflight.inspect_model_attributes(info, cfg)
+    print(attrs.get('model_kind', 'text_causal_lm'))
+except Exception:
+    mid = '${MODEL_ID}'.lower()
+    if any(k in mid for k in ['glm-ocr', 'ocr', 'vl', 'vision', 'multimodal']):
+        print('multimodal_causal_lm')
+    else:
+        print('text_causal_lm')
+" 2>/dev/null || echo "text_causal_lm")
+  fi
 
   local payload
-  payload=$(cat <<EOF
+  if [ "${model_kind}" = "multimodal_causal_lm" ]; then
+    echo "Detected Model Kind: ${model_kind}"
+    echo "Generating deterministic OCR test image (RELAY GLM OCR TEST 123)..."
+    local image_data_uri
+    image_data_uri=$(python3 "${SCRIPT_DIR}/test_image.py")
+    payload=$(python3 -c "
+import json, sys
+data_uri = sys.argv[1]
+model = sys.argv[2]
+req = {
+    'model': model,
+    'messages': [
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'image_url', 'image_url': {'url': data_uri}},
+                {'type': 'text', 'text': 'Text Recognition: Extract all text from this image.'}
+            ]
+        }
+    ],
+    'temperature': 0.0,
+    'max_tokens': 64
+}
+print(json.dumps(req))
+" "${image_data_uri}" "${target_model}")
+  else
+    echo "Detected Model Kind: text_causal_lm"
+    payload=$(cat <<EOF
 {
   "model": "${target_model}",
   "messages": [
@@ -296,6 +342,9 @@ test_inference() {
 }
 EOF
 )
+  fi
+
+  echo "Sending test inference request to http://127.0.0.1:${PORT}/v1/chat/completions..."
 
   local start_time
   start_time=$(python3 -c "import time; print(time.time())")
@@ -320,6 +369,20 @@ EOF
     local preview
     preview=$(echo "${body}" | python3 -c "import sys, json; res=json.load(sys.stdin); print(res.get('choices', [{}])[0].get('message', {}).get('content', '').strip())" 2>/dev/null || echo "${body}")
     echo "Response Preview: ${preview}"
+    if [ "${model_kind}" = "multimodal_causal_lm" ]; then
+      echo "Multimodal OCR Validation:"
+      python3 -c "
+import sys
+text = sys.argv[1].upper()
+expected = ['RELAY', 'GLM', 'OCR', 'TEST', '123']
+found = [t for t in expected if t in text]
+print(f'  Matched {len(found)}/{len(expected)} expected tokens: {found}')
+if len(found) >= 2:
+    print('  OCR Smoke Test: PASSED')
+else:
+    print('  OCR Smoke Test: WARNING (Low token match, check preview)')
+" "${preview}"
+    fi
   else
     echo "FAILURE (HTTP ${http_code}) - Latency: ${latency_ms} ms" >&2
     echo "${body}" >&2

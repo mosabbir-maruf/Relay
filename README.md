@@ -190,11 +190,11 @@ Relay includes reproducible, turn-key deployment workflows for running open-weig
 
 ### 1. Generic vLLM Kaggle Deployment
 
-Deploy any supported Hugging Face model (e.g. Qwen2.5, Llama 3, Mistral) by specifying `MODEL_ID` in a single configuration cell with automated hardware preflight validation.
+Deploy any supported Hugging Face model—including causal text models (e.g. Qwen2.5, Llama 3, Mistral) and multimodal vision/OCR generative models (e.g. GLM-OCR)—by specifying `MODEL_ID` in a single configuration cell with automated hardware preflight validation.
 
 - **GitHub Source Notebook**: [notebooks/vllm-kaggle.ipynb](notebooks/vllm-kaggle.ipynb) (parameter-driven self-service deployment)
 - **Deployment Runbook**: [docs/kaggle-vllm.md](docs/kaggle-vllm.md) (hardware limits, overrides, preflight guide)
-- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`vllm.sh`, `preflight.py`, `cloudflared.sh`, `diagnostics.sh`)
+- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`vllm.sh`, `preflight.py`, `test_image.py`, `cloudflared.sh`, `diagnostics.sh`)
 
 ### 2. Qwen Reference Deployment
 
@@ -532,6 +532,7 @@ Relay/
 ├── infra/
 │   └── kaggle/               # Reusable Kaggle deployment and diagnostic scripts
 ├── notebooks/
+│   ├── vllm-kaggle.ipynb      # Generic self-service Hugging Face → vLLM runbook
 │   └── qwen-vllm-kaggle.ipynb # Canonical executable Kaggle deployment runbook
 ├── docs/                     # Technical architecture and feature documentation
 ├── LICENSE                   # MIT License
@@ -543,6 +544,7 @@ Relay/
 ## Documentation Index
 
 - [Architecture Overview](docs/architecture.md): Lifecycle diagrams, package layering, and design principles.
+- [Self-Hosted vLLM on Kaggle](docs/kaggle-vllm.md): Generic parameter-driven deployment guide and hardware compatibility reference.
 - [Self-Hosted Qwen/vLLM on Kaggle](docs/kaggle-qwen.md): Complete deployment runbook and verified configuration for dual T4 GPUs.
 - [Model Routing, Aliases & Fallbacks](docs/routing-and-fallbacks.md): Policy configuration, cycle detection, and fallback mechanics.
 - [Circuit Breaker Foundation](docs/circuit-breaker.md): State transitions, thresholds, and failure classification.
