@@ -54,9 +54,37 @@ Git tracks standard file contents and modes, but depending on how repositories a
 
 ---
 
+## Kaggle Prerequisites
+
+Before running the Relay infrastructure checks, make sure the Kaggle Notebook has a **GPU accelerator enabled** and **Internet access enabled**. The current Qwen deployment scripts target **dual NVIDIA Tesla T4 GPUs**.
+
+### Install vLLM
+
+The `qwen-vllm.sh` script expects the `vllm` CLI to already be installed. Install the version used by the verified Kaggle configuration:
+
+```python
+!python -m pip install -q --no-cache-dir "vllm==0.29.0"
+```
+
+Then verify the installation:
+
+```python
+!vllm --version
+```
+
+Expected output:
+
+```text
+0.29.0
+```
+
+> **Why this step matters:** `qwen-vllm.sh check` intentionally fails when the `vllm` binary is missing instead of silently installing dependencies. Keeping installation separate makes the runtime check predictable and makes failures easier to diagnose.
+
+---
+
 ## Recommended Execution Sequence
 
-Run each group below in a **separate Kaggle Code cell**. Each cell is Bash, so start it with `%%bash`.
+Run each group below in a **separate Kaggle Code cell**. Each shell-command cell starts with `%%bash` unless noted otherwise.
 
 ### 1. Preflight check
 
@@ -197,11 +225,12 @@ Because `WORK_DIR` defaults to `/kaggle/working`, all operational logs and PIDs 
 
 ## Troubleshooting Quick Reference
 
-| Issue                     | Diagnostic / Remediation                                                                |
-| :------------------------ | :-------------------------------------------------------------------------------------- |
-| **GPU out of memory**     | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                        |
-| **Port 8000 occupied**   | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                |
-| **Weights still loading** | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`. |
-| **Tunnel URL missing**    | Run `./infra/kaggle/cloudflared.sh logs 30`.                                            |
-| **Full Stack Health**     | Run `./infra/kaggle/diagnostics.sh all`.                                                |
-| **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell. |
+| Issue                              | Diagnostic / Remediation                                                                      |
+| :--------------------------------- | :-------------------------------------------------------------------------------------------- |
+| **`vllm` not found**               | Run the `Install vLLM` prerequisite above, then verify with `!vllm --version`.                |
+| **GPU out of memory**              | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                               |
+| **Port 8000 occupied**             | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                       |
+| **Weights still loading**          | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`.       |
+| **Tunnel URL missing**             | Run `./infra/kaggle/cloudflared.sh logs 30`.                                                   |
+| **Full Stack Health**              | Run `./infra/kaggle/diagnostics.sh all`.                                                       |
+| **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell.              |
