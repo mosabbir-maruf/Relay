@@ -206,7 +206,7 @@ A production-tested reference deployment for **Qwen3-Coder-30B-A3B-Instruct** (3
 - **GitHub Source Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb) (version-controlled repository source)
 - **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md) (step-by-step operational runbook & troubleshooting)
 - **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
-- **Gateway Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your `.env`.
+- **Gateway Configuration**: Set `VLLM_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `VLLM_MODEL=qwen3-coder-30b` in your `.env`.
 
 > [!NOTE]
 > Kaggle provides an ephemeral development and integration testing environment. Sessions are temporary and may terminate based on Kaggle runtime limits or inactivity. It is intended for development and evaluation, not persistent production infrastructure.
@@ -258,15 +258,15 @@ The Playground communicates with Relay using relative API paths:
 - `/v1/chat/completions` — Executes non-streaming and streaming completions
 - `/health` — Inspects live provider connectivity and latency
 
-The browser never calls `QWEN_BASE_URL` or upstream backends directly.
+The browser never calls `VLLM_BASE_URL` or upstream backends directly.
 
 ### Configuration
 
 The Playground relies on Relay's server-side environment configuration in `.env` (see the [Environment Configuration](#environment-configuration) table below):
 
 ```dotenv
-QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1
-QWEN_MODEL=qwen3-coder-30b
+VLLM_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1
+VLLM_MODEL=gpt2
 ```
 
 Upstream endpoint URLs and provider keys belong strictly in your local `.env` and are never hardcoded into client code. Cloudflare Quick Tunnel URLs are ephemeral and must be updated in `.env` whenever a new Kaggle session creates a new tunnel URL.
@@ -275,7 +275,7 @@ Upstream endpoint URLs and provider keys belong strictly in your local `.env` an
 
 - **UI Shell Isolation**: `/playground` serves the self-contained UI shell, while `/v1/*` endpoints maintain Relay's standard authentication behavior.
 - **Session-Only Credentials**: If `RELAY_API_KEY` is configured on the gateway, credentials can be entered in the Playground settings panel. The key is stored strictly in browser `sessionStorage` for that tab and is never saved to `localStorage` or disk.
-- **Zero Credential Exposure**: Server-side provider credentials (`GEMINI_API_KEY`, `QWEN_API_KEY`, upstream URLs) are never transmitted to or accessible from the browser.
+- **Zero Credential Exposure**: Server-side provider credentials (`GEMINI_API_KEY`, `VLLM_API_KEY`, upstream URLs) are never transmitted to or accessible from the browser.
 - **Strict Content Security Policy**: Enforces `connect-src 'self'`, `frame-ancestors 'none'`, and `base-uri 'none'` to restrict network egress exclusively to the Relay gateway and block framing/clickjacking attacks.
 
 ### Feature Highlights
@@ -310,9 +310,6 @@ Configuration is validated at startup using Zod. The primary configuration optio
 | `VLLM_BASE_URL`                     | `string`  |                   _empty_                   | Endpoint URL for self-hosted vLLM backend (e.g. `http://localhost:8000/v1`).      |
 | `VLLM_MODEL`                        | `string`  |                   _empty_                   | Model name exposed by the generic vLLM backend (e.g. `gpt2`, `qwen2.5-coder-7b`). |
 | `VLLM_API_KEY`                      | `string`  |                   _empty_                   | Optional API key for the vLLM backend.                                            |
-| `QWEN_BASE_URL`                     | `string`  |                   _empty_                   | Legacy endpoint URL for self-hosted Qwen vLLM backend.                            |
-| `QWEN_MODEL`                        | `string`  |              `qwen3-coder-30b`              | Legacy model name exposed by the Qwen vLLM backend.                               |
-| `QWEN_API_KEY`                      | `string`  |                   _empty_                   | Optional API key for the legacy Qwen backend.                                     |
 | `OPENAI_COMPATIBLE_BASE_URL`        | `string`  |                   _empty_                   | Generic OpenAI-compatible endpoint URL (e.g. `http://localhost:11434/v1`).        |
 | `OPENAI_COMPATIBLE_MODELS`          | `string`  |                   _empty_                   | Comma-separated list of models available on the generic backend.                  |
 | `ADDITIONAL_PROVIDERS`              | `string`  |                   _empty_                   | JSON array of extra OpenAI-compatible backends.                                   |
