@@ -170,11 +170,34 @@ start_server() {
     return 1
   fi
 
-  # Extract command args from JSON
-  local cmd_str
-  cmd_str=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin)[command_str])")
+  # Extract diagnostic metadata and executable argv array from JSON
   local served_name
-  served_name=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin)[served_model_name])")
+  served_name=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('served_model_name', ''))")
+
+  local cmd_str
+  cmd_str=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('command_str', ''))")
+
+  # Reconstruct argv array from preflight's authoritative command_args
+  local cmd_args=()
+  while IFS= read -r -d '' arg; do
+    cmd_args+=("${arg}")
+  done < <(echo "${preflight_json}" | python3 -c "import sys, json
+data = json.load(sys.stdin)
+for a in data.get('command_args', []):
+    sys.stdout.buffer.write(a.encode('utf-8') + b'\x00')
+")
+
+  if [ "${#cmd_args[@]}" -lt 3 ]; then
+    echo "ERROR: Malformed command arguments array from preflight. Expected at least 'vllm serve <MODEL_ID>'." >&2
+    return 1
+  fi
+
+  # Resolve absolute path to vllm binary if available on PATH
+  local vllm_bin
+  vllm_bin=$(command -v "${cmd_args[0]}" 2>/dev/null || true)
+  if [ -n "${vllm_bin}" ]; then
+    cmd_args[0]="${vllm_bin}"
+  fi
 
   mkdir -p "${WORK_DIR}"
   echo "Launching vLLM in background..."
@@ -183,7 +206,8 @@ start_server() {
   echo "Log file:    ${LOG_FILE}"
   echo "Command:     ${cmd_str}"
 
-  nohup bash -c "exec ${cmd_str}" > "${LOG_FILE}" 2>&1 &
+  # Launch directly using argv array without eval or shell string reconstruction
+  nohup "${cmd_args[@]}" > "${LOG_FILE}" 2>&1 &
   local server_pid=$!
   echo "${server_pid}" > "${PID_FILE}"
   echo "vLLM process launched with PID: ${server_pid}"
@@ -243,12 +267,13 @@ test_inference() {
   if [ -z "${target_model}" ]; then
     # Probe local endpoint for registered model
     if command -v curl >/dev/null 2>&1; then
-      target_model=$(curl -s --connect-timeout 3 "http://127.0.0.1:${PORT}/v1/models" |         python3 -c "import sys, json; data=json.load(sys.stdin); models=data.get("data", []); print(models[0]["id"] if models else "")" 2>/dev/null || true)
+      target_model=$(curl -s --connect-timeout 3 "http://127.0.0.1:${PORT}/v1/models" | \
+        python3 -c "import sys, json; data=json.load(sys.stdin); models=data.get('data', []); print(models[0]['id'] if models else '')" 2>/dev/null || true)
     fi
   fi
 
   if [ -z "${target_model}" ] && [ -n "${MODEL_ID:-}" ]; then
-    target_model=$(python3 -c "import sys, os; sys.path.insert(0, "${SCRIPT_DIR}"); import preflight; print(preflight.sanitize_served_name("${MODEL_ID}"))" 2>/dev/null || true)
+    target_model=$(python3 -c "import sys, os; sys.path.insert(0, '${SCRIPT_DIR}'); import preflight; print(preflight.sanitize_served_name('${MODEL_ID}'))" 2>/dev/null || true)
   fi
 
   if [ -z "${target_model}" ]; then
@@ -283,7 +308,7 @@ EOF
   local end_time
   end_time=$(python3 -c "import time; print(time.time())")
   local latency_ms
-  latency_ms=$(python3 -c "print(f"{(${end_time} - ${start_time}) * 1000:.1f}")")
+  latency_ms=$(python3 -c "import sys; s=float(sys.argv[1]); e=float(sys.argv[2]); print(f'{(e - s) * 1000:.1f}')" "${start_time}" "${end_time}" 2>/dev/null || echo "0.0")
 
   local http_code
   http_code=$(echo "${res}" | grep "HTTP_STATUS:" | cut -d":" -f2)
@@ -293,7 +318,7 @@ EOF
   if [ "${http_code}" -eq 200 ]; then
     echo "SUCCESS (HTTP 200) - Latency: ${latency_ms} ms"
     local preview
-    preview=$(echo "${body}" | python3 -c "import sys, json; res=json.load(sys.stdin); print(res.get("choices", [{}])[0].get("message", {}).get("content", "").strip())" 2>/dev/null || echo "${body}")
+    preview=$(echo "${body}" | python3 -c "import sys, json; res=json.load(sys.stdin); print(res.get('choices', [{}])[0].get('message', {}).get('content', '').strip())" 2>/dev/null || echo "${body}")
     echo "Response Preview: ${preview}"
   else
     echo "FAILURE (HTTP ${http_code}) - Latency: ${latency_ms} ms" >&2

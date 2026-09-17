@@ -7,6 +7,7 @@ Compatible with Python 3.8+ unittest.
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 import urllib.error
@@ -320,6 +321,88 @@ class TestPreflight(unittest.TestCase):
         ]
         for key in required_keys:
             self.assertIn(key, parsed)
+
+    def test_command_args_executable_array(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 4096,
+            "torch_dtype": "float16",
+            "quantization_method": None,
+            "param_count": 7_620_000_000,
+            "requires_remote_code": False,
+            "gated": False,
+        }
+        resolved = preflight.resolve_configuration(
+            "Qwen/Qwen2.5-Coder-7B-Instruct", attrs, {}
+        )
+        cmd_args = resolved["command_args"]
+        self.assertIsInstance(cmd_args, list)
+        self.assertEqual(cmd_args[0], "vllm")
+        self.assertEqual(cmd_args[1], "serve")
+        self.assertEqual(cmd_args[2], "Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.assertIn("--served-model-name", cmd_args)
+        self.assertIn("qwen2.5-coder-7b-instruct", cmd_args)
+        self.assertIn("--tensor-parallel-size", cmd_args)
+        self.assertIn("2", cmd_args)
+        self.assertIn("--dtype", cmd_args)
+        self.assertIn("float16", cmd_args)
+        self.assertIn("--gpu-memory-utilization", cmd_args)
+        self.assertIn("0.85", cmd_args)
+        self.assertIn("--enforce-eager", cmd_args)
+        self.assertEqual(resolved["command_str"], " ".join(cmd_args))
+
+    def test_vllm_sh_start_extraction_regression(self):
+        """Regression test for Kaggle Step 7 NameError: name 'command_str' is not defined."""
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 4096,
+            "torch_dtype": "float16",
+            "quantization_method": None,
+            "param_count": 7_620_000_000,
+            "requires_remote_code": False,
+            "gated": False,
+        }
+        resolved = preflight.resolve_configuration(
+            "Qwen/Qwen2.5-Coder-7B-Instruct", attrs, {}
+        )
+        preflight_json = json.dumps(resolved)
+
+        bash_script = """
+        set -euo pipefail
+        preflight_json="$1"
+
+        served_name=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('served_model_name', ''))")
+        cmd_str=$(echo "${preflight_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('command_str', ''))")
+
+        cmd_args=()
+        while IFS= read -r -d '' arg; do
+          cmd_args+=("${arg}")
+        done < <(echo "${preflight_json}" | python3 -c "import sys, json
+data = json.load(sys.stdin)
+for a in data.get('command_args', []):
+    sys.stdout.buffer.write(a.encode('utf-8') + b'\\x00')
+")
+
+        echo "SERVED_NAME:${served_name}"
+        echo "CMD_STR:${cmd_str}"
+        echo "ARGS_COUNT:${#cmd_args[@]}"
+        echo "FIRST_ARG:${cmd_args[0]}"
+        echo "SECOND_ARG:${cmd_args[1]}"
+        """
+
+        res = subprocess.run(
+            ["bash", "-c", bash_script, "bash", preflight_json],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        output = res.stdout
+        self.assertIn("SERVED_NAME:qwen2.5-coder-7b-instruct", output)
+        self.assertIn("ARGS_COUNT:20", output)
+        self.assertIn("FIRST_ARG:vllm", output)
+        self.assertIn("SECOND_ARG:serve", output)
 
 
 if __name__ == "__main__":
