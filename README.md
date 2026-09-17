@@ -188,8 +188,11 @@ pnpm build
 
 Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3B-Instruct** via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs in Kaggle and exposing it securely to Relay over an encrypted Cloudflare Quick Tunnel.
 
-- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md)
-- **Executable Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb)
+[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm)
+
+- **Published Kaggle Notebook**: [kaggle.com/code/mosabbir-maruf/qwen-vllm](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm) (interactive 1-click cloud execution)
+- **GitHub Source Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb) (version-controlled repository source)
+- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md) (step-by-step operational guide & troubleshooting)
 - **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
 - **Gateway Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your `.env`.
 
