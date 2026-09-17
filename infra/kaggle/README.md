@@ -18,18 +18,35 @@ This directory contains production-tested, reproducible management scripts for d
 
 These scripts live in the canonical Relay GitHub repository. **They are not manually created or uploaded to Kaggle.**
 
-When running in a Kaggle session, pull the scripts by cloning the repository into `/kaggle/working/Relay`:
+When running in a Kaggle/Jupyter session, remember that notebook **Code** cells execute Python by default. The commands below are **Bash/shell commands**, so run them in a cell prefixed with `%%bash`.
+
+### Clone the repository
 
 ```bash
-# 1. Clone the Relay repository
-git clone https://github.com/mosabbir-maruf/Relay.git /kaggle/working/Relay
+%%bash
+set -e
 
-# 2. Change into the repository directory
+if [ -d /kaggle/working/Relay/.git ]; then
+  echo "Relay repository already exists. Skipping clone."
+else
+  git clone https://github.com/mosabbir-maruf/Relay.git /kaggle/working/Relay
+fi
+
 cd /kaggle/working/Relay
-
-# 3. Grant execute permissions to the scripts
 chmod +x infra/kaggle/*.sh
+
+echo "Relay Kaggle scripts are ready."
 ```
+
+> **Important:** Do not paste `git clone`, `cd`, or `chmod` directly into a normal Python Code cell. Doing so will result in a Python `SyntaxError`.
+
+For a single shell command, Kaggle also supports the `!` prefix, for example:
+
+```python
+!nvidia-smi
+```
+
+For multiple related shell commands, prefer `%%bash` because the entire cell then runs in one Bash process.
 
 ### Why `chmod +x` is Required
 
@@ -39,37 +56,99 @@ Git tracks standard file contents and modes, but depending on how repositories a
 
 ## Recommended Execution Sequence
 
-Run all commands from `/kaggle/working/Relay`:
+Run each group below in a **separate Kaggle Code cell**. Each cell is Bash, so start it with `%%bash`.
+
+### 1. Preflight check
 
 ```bash
-# Step 1: Preflight check (GPUs, vLLM CLI, port 8000)
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/qwen-vllm.sh check
+```
 
-# Step 2: Full diagnostic sweep (detects existing sessions or port conflicts)
+Checks the GPU environment, vLLM CLI, and port 8000 before starting anything.
+
+### 2. Full diagnostic sweep
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/diagnostics.sh all
+```
 
-# Step 3: Clean up any stale listeners on port 8000
+Detects existing processes, port conflicts, CUDA/GPU issues, networking state, and tunnel state.
+
+### 3. Clean up stale listeners
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/qwen-vllm.sh clean
+```
 
-# Step 4: Launch vLLM in background (TP=2, FP16, AWQ, eager execution)
+### 4. Launch vLLM
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/qwen-vllm.sh start
+```
 
-# Step 5: Check server readiness (takes ~2-3 min for weight loading & KV cache)
+The script starts vLLM in the background using tensor parallelism across the two T4 GPUs.
+
+### 5. Check server readiness
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/qwen-vllm.sh status
+```
 
-# Step 6: Smoke test local inference (sends "PONG" prompt)
+Weight loading and KV-cache initialization may take a few minutes.
+
+### 6. Smoke test local inference
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/qwen-vllm.sh test
+```
 
-# Step 7: Verify or auto-download cloudflared binary
+This verifies that the local OpenAI-compatible endpoint can actually generate a response.
+
+### 7. Verify `cloudflared`
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/cloudflared.sh check
+```
 
-# Step 8: Start Cloudflare Quick Tunnel and display the dynamic public URL
+### 8. Start the Cloudflare Quick Tunnel
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/cloudflared.sh start
+```
 
-# Step 9: Inspect full status
+The command starts the tunnel in the background and exposes the local API through a temporary public URL.
+
+### 9. Inspect tunnel diagnostics
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/diagnostics.sh tunnel
+```
 
-# Step 10: Clean shutdown when finished
+### 10. Clean shutdown
+
+Run these when you are finished with the Kaggle session:
+
+```bash
+%%bash
+cd /kaggle/working/Relay
 ./infra/kaggle/cloudflared.sh stop
 ./infra/kaggle/qwen-vllm.sh stop
 ```
@@ -121,7 +200,8 @@ Because `WORK_DIR` defaults to `/kaggle/working`, all operational logs and PIDs 
 | Issue                     | Diagnostic / Remediation                                                                |
 | :------------------------ | :-------------------------------------------------------------------------------------- |
 | **GPU out of memory**     | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                        |
-| **Port 8000 occupied**    | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                |
+| **Port 8000 occupied**   | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                |
 | **Weights still loading** | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`. |
 | **Tunnel URL missing**    | Run `./infra/kaggle/cloudflared.sh logs 30`.                                            |
 | **Full Stack Health**     | Run `./infra/kaggle/diagnostics.sh all`.                                                |
+| **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell. |
