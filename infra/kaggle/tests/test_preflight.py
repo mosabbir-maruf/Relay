@@ -929,6 +929,173 @@ for a in data.get('command_args', []):
         # Crucially: if server was running default 'gpt2', validation of explicit override fails
         self.assertNotIn(effective_explicit, ["gpt2"])
 
+    def test_check_has_chat_template(self):
+        """Tests check_has_chat_template under diverse tokenizer_config structures."""
+        # Valid string template
+        has_t, desc = preflight.check_has_chat_template({"chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"})
+        self.assertTrue(has_t)
+        self.assertEqual(desc, "tokenizer has valid chat template")
+
+        # Valid list of dict templates
+        has_t, desc = preflight.check_has_chat_template({"chat_template": [{"name": "default", "template": "{{ messages }}"}]})
+        self.assertTrue(has_t)
+        self.assertEqual(desc, "tokenizer has valid chat template")
+
+        # Missing chat_template
+        has_t, desc = preflight.check_has_chat_template({})
+        self.assertFalse(has_t)
+        self.assertEqual(desc, "tokenizer has no usable chat template")
+
+        # None chat_template
+        has_t, desc = preflight.check_has_chat_template({"chat_template": None})
+        self.assertFalse(has_t)
+        self.assertEqual(desc, "tokenizer has no usable chat template")
+
+        # Empty string
+        has_t, desc = preflight.check_has_chat_template({"chat_template": "   "})
+        self.assertFalse(has_t)
+        self.assertEqual(desc, "tokenizer has no usable chat template")
+
+        # List with no valid template key
+        has_t, desc = preflight.check_has_chat_template({"chat_template": [{"name": "default"}]})
+        self.assertFalse(has_t)
+        self.assertEqual(desc, "tokenizer has no usable chat template")
+
+        # Non-dict tokenizer config
+        has_t, desc = preflight.check_has_chat_template(None)
+        self.assertFalse(has_t)
+        self.assertEqual(desc, "tokenizer has no usable chat template")
+
+    def test_test_plan_gpt2_no_chat_template(self):
+        """
+        Regression test: GPT-2 / base causal model with no chat template
+        must select /v1/completions with prompt 'Hello, my name is' and max_tokens 20.
+        """
+        model_id = "openai-community/gpt2"
+        attrs = {
+            "model_kind": "text_causal_lm",
+            "has_chat_template": False,
+            "chat_template_desc": "tokenizer has no usable chat template",
+            "context_length": 1024,
+            "param_count": 124_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            model_id, attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertIn("inference_test_plan", resolved)
+        plan = resolved["inference_test_plan"]
+
+        self.assertEqual(plan["test_api"], "/v1/completions")
+        self.assertEqual(plan["endpoint"], "/v1/completions")
+        self.assertEqual(plan["reason"], "tokenizer has no usable chat template")
+        self.assertFalse(plan["is_chat"])
+        self.assertFalse(plan["is_multimodal"])
+        self.assertFalse(plan["has_chat_template"])
+        self.assertEqual(plan["payload"]["model"], "gpt2")
+        self.assertEqual(plan["payload"]["prompt"], "Hello, my name is")
+        self.assertEqual(plan["payload"]["max_tokens"], 20)
+        self.assertEqual(plan["payload"]["temperature"], 0.0)
+
+    def test_test_plan_instruct_model_with_chat_template(self):
+        """
+        Regression test: Instruct / chat model with a valid chat template
+        must select /v1/chat/completions with PONG smoke test prompt.
+        """
+        model_id = "Qwen/Qwen2.5-Coder-7B-Instruct"
+        attrs = {
+            "model_kind": "text_causal_lm",
+            "has_chat_template": True,
+            "chat_template_desc": "tokenizer has valid chat template",
+            "context_length": 32768,
+            "param_count": 7_000_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            model_id, attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertIn("inference_test_plan", resolved)
+        plan = resolved["inference_test_plan"]
+
+        self.assertEqual(plan["test_api"], "/v1/chat/completions")
+        self.assertEqual(plan["endpoint"], "/v1/chat/completions")
+        self.assertEqual(plan["reason"], "tokenizer has valid chat template")
+        self.assertTrue(plan["is_chat"])
+        self.assertFalse(plan["is_multimodal"])
+        self.assertTrue(plan["has_chat_template"])
+        self.assertEqual(plan["payload"]["model"], "qwen2.5-coder-7b-instruct")
+        self.assertEqual(
+            plan["payload"]["messages"],
+            [{"role": "user", "content": "Reply with only the single word PONG"}],
+        )
+        self.assertEqual(plan["payload"]["max_tokens"], 16)
+
+    def test_test_plan_missing_or_invalid_chat_template_fallback(self):
+        """
+        Regression test: Models with missing or corrupt chat templates safely
+        fall back to /v1/completions without raising errors.
+        """
+        # Case 1: Tokenizer config is empty
+        plan1 = preflight.resolve_inference_test_plan(
+            model_id="custom/base-model",
+            target_model="base-model",
+            attrs={"model_kind": "text_causal_lm", "tokenizer_config": {}},
+        )
+        self.assertEqual(plan1["test_api"], "/v1/completions")
+        self.assertEqual(plan1["reason"], "tokenizer has no usable chat template")
+        self.assertFalse(plan1["is_chat"])
+
+        # Case 2: Chat template is whitespace
+        plan2 = preflight.resolve_inference_test_plan(
+            model_id="custom/corrupt-model",
+            target_model="corrupt-model",
+            attrs={"model_kind": "text_causal_lm", "tokenizer_config": {"chat_template": "   "}},
+        )
+        self.assertEqual(plan2["test_api"], "/v1/completions")
+        self.assertEqual(plan2["reason"], "tokenizer has no usable chat template")
+
+        # Case 3: Empty resolved config / no metadata available
+        plan3 = preflight.resolve_inference_test_plan(
+            model_id="custom/unknown-model",
+            target_model="unknown-model",
+            attrs={"model_kind": "text_causal_lm"},
+        )
+        self.assertEqual(plan3["test_api"], "/v1/completions")
+        self.assertEqual(plan3["reason"], "tokenizer has no usable chat template")
+
+    def test_test_plan_multimodal_model_endpoint(self):
+        """
+        Regression test: Multimodal vision/OCR models must always use
+        /v1/chat/completions with image data URI payload regardless of tokenizer template.
+        """
+        model_id = "zai-org/GLM-OCR"
+        attrs = {
+            "model_kind": "multimodal_causal_lm",
+            "has_chat_template": False,
+            "chat_template_desc": "tokenizer has no usable chat template",
+            "context_length": 8192,
+            "param_count": 900_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            model_id, attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertIn("inference_test_plan", resolved)
+        plan = resolved["inference_test_plan"]
+
+        self.assertEqual(plan["test_api"], "/v1/chat/completions")
+        self.assertEqual(plan["endpoint"], "/v1/chat/completions")
+        self.assertEqual(
+            plan["reason"],
+            "multimodal vision/OCR architecture requires chat message format",
+        )
+        self.assertTrue(plan["is_chat"])
+        self.assertTrue(plan["is_multimodal"])
+        self.assertEqual(plan["payload"]["model"], "glm-ocr")
+        messages = plan["payload"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        contents = messages[0]["content"]
+        self.assertTrue(any(c.get("type") == "image_url" for c in contents))
+        self.assertTrue(any(c.get("type") == "text" for c in contents))
+
 
 if __name__ == "__main__":
     unittest.main()

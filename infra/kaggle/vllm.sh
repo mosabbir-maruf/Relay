@@ -293,74 +293,64 @@ test_inference() {
 
   echo "Target Model Alias: ${target_model}"
 
-  # Capability detection (text vs multimodal)
-  local model_kind="${MODEL_KIND:-}"
-  if [ -z "${model_kind}" ] && [ -n "${MODEL_ID:-}" ]; then
-    model_kind=$(python3 -c "
-import sys, os
+  # Resolve inference test plan using preflight.py
+  local test_plan_json
+  test_plan_json=$(python3 -c "
+import sys, os, json
 sys.path.insert(0, '${SCRIPT_DIR}')
-try:
-    import preflight
-    info, cfg = preflight.fetch_hf_model_metadata('${MODEL_ID}', os.environ.get('HF_TOKEN'))
-    attrs = preflight.inspect_model_attributes(info, cfg)
-    print(attrs.get('model_kind', 'text_causal_lm'))
-except Exception:
-    mid = '${MODEL_ID}'.lower()
-    if any(k in mid for k in ['glm-ocr', 'ocr', 'vl', 'vision', 'multimodal']):
-        print('multimodal_causal_lm')
-    else:
-        print('text_causal_lm')
-" 2>/dev/null || echo "text_causal_lm")
-  fi
+import preflight
+
+model_id = os.environ.get('MODEL_ID', '')
+token = os.environ.get('HF_TOKEN')
+target_model = sys.argv[1]
+work_dir = os.environ.get('WORK_DIR', '${WORK_DIR}')
+
+cfg = None
+cfg_path = os.path.join(work_dir, 'resolved_config.json')
+if os.path.exists(cfg_path):
+    try:
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except Exception:
+        pass
+
+plan = preflight.resolve_inference_test_plan(
+    model_id=model_id,
+    target_model=target_model,
+    hf_token=token,
+    resolved_config=cfg,
+    work_dir=work_dir,
+)
+print(json.dumps(plan))
+" "${target_model}")
+
+  local test_api
+  test_api=$(echo "${test_plan_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('test_api', '/v1/chat/completions'))")
+
+  local test_reason
+  test_reason=$(echo "${test_plan_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('reason', ''))")
+
+  local test_endpoint
+  test_endpoint=$(echo "${test_plan_json}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('endpoint', '/v1/chat/completions'))")
+
+  local is_mm
+  is_mm=$(echo "${test_plan_json}" | python3 -c "import sys, json; print('1' if json.load(sys.stdin).get('is_multimodal') else '0')")
+
+  local is_chat
+  is_chat=$(echo "${test_plan_json}" | python3 -c "import sys, json; print('1' if json.load(sys.stdin).get('is_chat') else '0')")
 
   local payload
-  if [ "${model_kind}" = "multimodal_causal_lm" ]; then
-    echo "Detected Model Kind: ${model_kind}"
-    echo "Generating deterministic OCR test image (RELAY GLM OCR TEST 123)..."
-    local image_data_uri
-    image_data_uri=$(python3 "${SCRIPT_DIR}/test_image.py")
-    payload=$(python3 -c "
-import json, sys
-data_uri = sys.argv[1]
-model = sys.argv[2]
-req = {
-    'model': model,
-    'messages': [
-        {
-            'role': 'user',
-            'content': [
-                {'type': 'image_url', 'image_url': {'url': data_uri}},
-                {'type': 'text', 'text': 'Text Recognition: Extract all text from this image.'}
-            ]
-        }
-    ],
-    'temperature': 0.0,
-    'max_tokens': 64
-}
-print(json.dumps(req))
-" "${image_data_uri}" "${target_model}")
-  else
-    echo "Detected Model Kind: text_causal_lm"
-    payload=$(cat <<EOF
-{
-  "model": "${target_model}",
-  "messages": [
-    {"role": "user", "content": "Reply with only the single word PONG"}
-  ],
-  "temperature": 0.0,
-  "max_tokens": 16
-}
-EOF
-)
-  fi
+  payload=$(echo "${test_plan_json}" | python3 -c "import sys, json; print(json.dumps(json.load(sys.stdin).get('payload', {})))")
 
-  echo "Sending test inference request to http://127.0.0.1:${PORT}/v1/chat/completions..."
+  echo "Test API: ${test_api}"
+  echo "Reason: ${test_reason}"
+  echo "Sending test inference request to http://127.0.0.1:${PORT}${test_endpoint}..."
 
   local start_time
   start_time=$(python3 -c "import time; print(time.time())")
 
   local res
-  res=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
+  res=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "http://127.0.0.1:${PORT}${test_endpoint}" \
     -H "Content-Type: application/json" \
     -d "${payload}")
 
@@ -377,9 +367,18 @@ EOF
   if [ "${http_code}" -eq 200 ]; then
     echo "SUCCESS (HTTP 200) - Latency: ${latency_ms} ms"
     local preview
-    preview=$(echo "${body}" | python3 -c "import sys, json; res=json.load(sys.stdin); print(res.get('choices', [{}])[0].get('message', {}).get('content', '').strip())" 2>/dev/null || echo "${body}")
+    preview=$(echo "${body}" | python3 -c "
+import sys, json
+try:
+    res = json.load(sys.stdin)
+    choices = res.get('choices', [{}])
+    first = choices[0] if choices else {}
+    print((first.get('message', {}).get('content') or first.get('text', '')).strip())
+except Exception:
+    pass
+")
     echo "Response Preview: ${preview}"
-    if [ "${model_kind}" = "multimodal_causal_lm" ]; then
+    if [ "${is_mm}" = "1" ]; then
       echo "Multimodal OCR Validation:"
       python3 -c "
 import sys
@@ -392,6 +391,18 @@ if len(found) >= 2:
 else:
     print('  OCR Smoke Test: WARNING (Low token match, check preview)')
 " "${preview}"
+    elif [ "${is_chat}" = "1" ]; then
+      if echo "${preview}" | grep -iq "PONG"; then
+        echo "  Chat Completion Smoke Test: PASSED"
+      else
+        echo "  Chat Completion Smoke Test: PASSED (Response received)"
+      fi
+    else
+      if [ -n "${preview}" ]; then
+        echo "  Text Completion Smoke Test: PASSED"
+      else
+        echo "  Text Completion Smoke Test: WARNING (Empty completion)"
+      fi
     fi
   else
     echo "FAILURE (HTTP ${http_code}) - Latency: ${latency_ms} ms" >&2

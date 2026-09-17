@@ -322,6 +322,165 @@ def resolve_effective_served_model_name(
     return "model"
 
 
+def check_has_chat_template(
+    tokenizer_config: Optional[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """
+    Checks if tokenizer_config contains a non-empty, usable chat_template.
+    Returns (has_template: bool, description: str).
+    """
+    if not isinstance(tokenizer_config, dict):
+        return False, "tokenizer has no usable chat template"
+
+    ct = tokenizer_config.get("chat_template")
+    if ct is None:
+        return False, "tokenizer has no usable chat template"
+
+    if isinstance(ct, str):
+        cleaned = ct.strip()
+        if not cleaned:
+            return False, "tokenizer has no usable chat template"
+        return True, "tokenizer has valid chat template"
+
+    if isinstance(ct, list):
+        valid = any(
+            isinstance(item, dict) and bool(str(item.get("template", "")).strip())
+            for item in ct
+        )
+        if valid:
+            return True, "tokenizer has valid chat template"
+        return False, "tokenizer has no usable chat template"
+
+    return False, "tokenizer has no usable chat template"
+
+
+def resolve_inference_test_plan(
+    model_id: Optional[str] = None,
+    target_model: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    resolved_config: Optional[Dict[str, Any]] = None,
+    attrs: Optional[Dict[str, Any]] = None,
+    work_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Determines whether to test via /v1/chat/completions or /v1/completions based
+    on model kind and tokenizer chat template capability.
+    """
+    effective_target = target_model or resolve_effective_served_model_name(
+        model_id=model_id, resolved_config=resolved_config, work_dir=work_dir
+    )
+
+    # 1. Determine model kind
+    model_kind = "text_causal_lm"
+    if resolved_config and isinstance(resolved_config, dict) and "model_kind" in resolved_config:
+        model_kind = resolved_config["model_kind"]
+    elif attrs and isinstance(attrs, dict) and "model_kind" in attrs:
+        model_kind = attrs["model_kind"]
+    elif model_id:
+        mid_lower = str(model_id).lower()
+        if any(k in mid_lower for k in ["glm-ocr", "ocr", "vl", "vision", "multimodal"]):
+            model_kind = "multimodal_causal_lm"
+
+    # 2. Determine chat template capability
+    has_chat_template = False
+    reason_desc = "tokenizer has no usable chat template"
+
+    if resolved_config and isinstance(resolved_config, dict):
+        if "inference_test_plan" in resolved_config and isinstance(resolved_config["inference_test_plan"], dict):
+            has_chat_template = resolved_config["inference_test_plan"].get("has_chat_template", False)
+            reason_desc = resolved_config["inference_test_plan"].get("reason", reason_desc)
+        elif "has_chat_template" in resolved_config:
+            has_chat_template = bool(resolved_config["has_chat_template"])
+            reason_desc = "tokenizer has valid chat template" if has_chat_template else "tokenizer has no usable chat template"
+    elif attrs and isinstance(attrs, dict):
+        if "has_chat_template" in attrs:
+            has_chat_template = bool(attrs["has_chat_template"])
+            reason_desc = "tokenizer has valid chat template" if has_chat_template else "tokenizer has no usable chat template"
+        elif "tokenizer_config" in attrs and isinstance(attrs["tokenizer_config"], dict):
+            has_chat_template, reason_desc = check_has_chat_template(attrs["tokenizer_config"])
+
+    # If still undetermined and model_id provided, attempt remote check
+    if not has_chat_template and model_id and not (attrs and "has_chat_template" in attrs):
+        try:
+            tok_url = f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json"
+            headers = {"User-Agent": "Relay-Kaggle-Preflight/1.0"}
+            if hf_token:
+                headers["Authorization"] = f"Bearer {hf_token.strip()}"
+            tok_req = urllib.request.Request(tok_url, headers=headers)
+            with urllib.request.urlopen(tok_req, timeout=5) as resp:
+                tok_cfg = json.loads(resp.read().decode("utf-8"))
+                has_chat_template, reason_desc = check_has_chat_template(tok_cfg)
+        except Exception:
+            has_chat_template = False
+            reason_desc = "tokenizer has no usable chat template"
+
+    # 3. Construct test endpoint and payload
+    if model_kind == "multimodal_causal_lm":
+        data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        try:
+            import test_image  # type: ignore
+            data_uri = test_image.generate_test_data_uri()
+        except Exception:
+            pass
+
+        return {
+            "endpoint": "/v1/chat/completions",
+            "test_api": "/v1/chat/completions",
+            "reason": "multimodal vision/OCR architecture requires chat message format",
+            "is_chat": True,
+            "is_multimodal": True,
+            "has_chat_template": has_chat_template,
+            "payload": {
+                "model": effective_target,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                            {"type": "text", "text": "Text Recognition: Extract all text from this image."},
+                        ],
+                    }
+                ],
+                "temperature": 0.0,
+                "max_tokens": 64,
+            },
+        }
+
+    if has_chat_template:
+        return {
+            "endpoint": "/v1/chat/completions",
+            "test_api": "/v1/chat/completions",
+            "reason": "tokenizer has valid chat template",
+            "is_chat": True,
+            "is_multimodal": False,
+            "has_chat_template": True,
+            "payload": {
+                "model": effective_target,
+                "messages": [
+                    {"role": "user", "content": "Reply with only the single word PONG"}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 16,
+            },
+        }
+
+    # Text causal model without chat template (e.g. GPT-2)
+    return {
+        "endpoint": "/v1/completions",
+        "test_api": "/v1/completions",
+        "reason": "tokenizer has no usable chat template",
+        "is_chat": False,
+        "is_multimodal": False,
+        "has_chat_template": False,
+        "payload": {
+            "model": effective_target,
+            "prompt": "Hello, my name is",
+            "max_tokens": 20,
+            "temperature": 0.0,
+        },
+    }
+
+
 def detect_gpus() -> Dict[str, Any]:
     """
     Detects available NVIDIA GPUs via nvidia-smi.
@@ -452,6 +611,19 @@ def fetch_hf_model_metadata(
             if not isinstance(config, dict):
                 config = {}
 
+    # 3. Fetch tokenizer_config.json to inspect chat_template
+    tokenizer_config = None
+    tok_url = f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json"
+    tok_req = urllib.request.Request(tok_url, headers=headers)
+    try:
+        with urllib.request.urlopen(tok_req, timeout=8) as tok_resp:
+            tokenizer_config = json.loads(tok_resp.read().decode("utf-8"))
+    except Exception:
+        tokenizer_config = None
+
+    if tokenizer_config is not None:
+        model_info["tokenizer_config"] = tokenizer_config
+
     return model_info, config
 
 
@@ -527,7 +699,9 @@ def extract_attention_dimensions(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def inspect_model_attributes(
-    model_info: Dict[str, Any], config: Dict[str, Any]
+    model_info: Dict[str, Any],
+    config: Dict[str, Any],
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Extracts architecture, quantization, context, and size attributes."""
     attrs: Dict[str, Any] = {}
@@ -630,6 +804,36 @@ def inspect_model_attributes(
 
     # Gated check
     attrs["gated"] = bool(model_info.get("gated", False))
+
+    # Chat template capability check
+    tok_cfg = tokenizer_config or model_info.get("tokenizer_config")
+    if tok_cfg is None and isinstance(config, dict) and "tokenizer_config" in config:
+        tok_cfg = config.get("tokenizer_config")
+
+    if tok_cfg is not None:
+        has_chat_template, chat_template_desc = check_has_chat_template(tok_cfg)
+    else:
+        if "has_chat_template" in model_info:
+            has_chat_template = bool(model_info["has_chat_template"])
+            chat_template_desc = (
+                "tokenizer has valid chat template"
+                if has_chat_template
+                else "tokenizer has no usable chat template"
+            )
+        elif isinstance(config, dict) and "has_chat_template" in config:
+            has_chat_template = bool(config["has_chat_template"])
+            chat_template_desc = (
+                "tokenizer has valid chat template"
+                if has_chat_template
+                else "tokenizer has no usable chat template"
+            )
+        else:
+            has_chat_template = False
+            chat_template_desc = "tokenizer has no usable chat template"
+
+    attrs["has_chat_template"] = has_chat_template
+    attrs["chat_template_desc"] = chat_template_desc
+    attrs["tokenizer_config"] = tok_cfg
 
     return attrs
 
@@ -1161,11 +1365,19 @@ def recommend_configuration(
     if extra_args:
         cmd_args.extend(extra_args)
 
+    test_plan = resolve_inference_test_plan(
+        model_id=model_id,
+        target_model=final_name,
+        attrs=attrs,
+    )
+
     return {
         "status": "CANDIDATE_RECOMMENDED",
         "model_id": model_id,
         "model_kind": model_kind,
         "modalities": modalities,
+        "has_chat_template": attrs.get("has_chat_template", False),
+        "inference_test_plan": test_plan,
         "served_model_name": final_name,
         "tensor_parallel_size": rec_tp,
         "dtype": final_dtype,
@@ -1390,7 +1602,14 @@ def print_diagnostic_report(
         f"     Remote Code:       {'Required (auto_map in config)' if attrs.get('requires_remote_code') else 'Disabled (standard)'}\n"
     )
     p(f"     Gated Repository:  {'Yes' if attrs.get('gated') else 'No'}\n")
-    p(f"     HF Token Status:   {mask_token(hf_token)}\n\n")
+    p(f"     HF Token Status:   {mask_token(hf_token)}\n")
+    has_ct = attrs.get("has_chat_template", False)
+    ct_desc = (
+        "Available (chat completions supported)"
+        if has_ct
+        else "None (completions endpoint only)"
+    )
+    p(f"     Chat Template:     {ct_desc}\n\n")
 
     # Section 2: Detected Hardware Environment
     p(" [2] Detected Hardware Environment\n")
@@ -1485,6 +1704,14 @@ def print_diagnostic_report(
     # Section 5: Generated vLLM Execution Command
     p(" [5] Generated vLLM Execution Command\n")
     p(f"     {resolved.get('command_str')}\n\n")
+
+    # Section 6: Smoke Test Inference Plan
+    plan = resolved.get("inference_test_plan", {})
+    if plan:
+        p(" [6] Smoke Test Inference Plan\n")
+        p(f"     Test API:          {plan.get('test_api')}\n")
+        p(f"     Reason:            {plan.get('reason')}\n")
+        p(f"     Target Endpoint:   {plan.get('endpoint')}\n\n")
 
     # Advisory Notice
     p("=" * 68 + "\n")
