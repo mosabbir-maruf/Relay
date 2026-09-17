@@ -13,6 +13,7 @@ Compatible with Python 3.8+ (Zero third-party runtime dependencies).
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -46,6 +47,8 @@ KNOWN_ARCHITECTURE_MIN_VLLM_VERSIONS: Dict[str, str] = {
     "glmocrforconditionalgeneration": "0.16.0",
     "qwen2vlforconditionalgeneration": "0.20.0",
     "qwen2_5_vlforconditionalgeneration": "0.25.0",
+    "smolvlmforconditionalgeneration": "0.28.0",
+    "idefics3forconditionalgeneration": "0.26.0",
 }
 
 # Unsupported non-causal LM architectures
@@ -94,6 +97,8 @@ SUPPORTED_MULTIMODAL_ARCH_PATTERNS = [
     r".*paligemma.*",
     r".*mllama.*",
     r".*chameleon.*",
+    r".*smolvlm.*",
+    r".*idefics.*",
 ]
 
 SUPPORTED_MULTIMODAL_MODEL_TYPES = {
@@ -105,7 +110,182 @@ SUPPORTED_MULTIMODAL_MODEL_TYPES = {
     "paligemma",
     "mllama",
     "chameleon",
+    "smolvlm",
+    "idefics",
+    "idefics2",
+    "idefics3",
 }
+
+# Processor & Runtime Dependency Registry for supported multimodal and complex architectures.
+# Precedence: processor metadata (processor_class)
+#             > architecture / model_type
+#             > model_id pattern
+PROCESSOR_DEPENDENCY_REGISTRY: List[Dict[str, Any]] = [
+    {
+        "id": "smolvlm_processor",
+        "match_processor_classes": {"smolvlmprocessor"},
+        "match_model_types": {"smolvlm"},
+        "match_architectures": [r".*smolvlm.*"],
+        "match_model_id_patterns": [r".*smolvlm.*"],
+        "packages": [
+            {
+                "pip_name": "num2words",
+                "import_name": "num2words",
+                "reason": "Required by SmolVLMProcessor for text normalization and numeric tokenization",
+            }
+        ],
+    },
+    {
+        "id": "idefics_processor",
+        "match_processor_classes": {
+            "ideficsprocessor",
+            "idefics2processor",
+            "idefics3processor",
+        },
+        "match_model_types": {"idefics", "idefics2", "idefics3"},
+        "match_architectures": [r".*idefics.*"],
+        "match_model_id_patterns": [r".*idefics.*"],
+        "packages": [],  # Generic Idefics/Idefics2/Idefics3 does not require num2words
+    },
+]
+
+
+def is_package_installed(import_name: str) -> bool:
+    """Checks if a python package is installed and importable in current runtime without side effects."""
+    try:
+        return importlib.util.find_spec(import_name) is not None
+    except Exception:
+        return False
+
+
+def resolve_model_dependencies(
+    attrs: Dict[str, Any], extra_packages: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    Resolves required and missing processor/runtime dependencies for target model.
+    Matching precedence:
+      1. processor_class / processor metadata (strongest signal)
+      2. architecture / model_type
+      3. model_id pattern (fallback)
+      4. user/environment extra packages
+    """
+    proc_class = str(attrs.get("processor_class") or "").strip().lower()
+    model_type = str(attrs.get("model_type") or "").strip().lower()
+    archs = [str(a).strip().lower() for a in (attrs.get("architectures") or [])]
+    model_id = str(attrs.get("model_id") or "").strip().lower()
+
+    selected_entry: Optional[Dict[str, Any]] = None
+    match_source: Optional[str] = None
+
+    # Precedence 1: processor metadata
+    for entry in PROCESSOR_DEPENDENCY_REGISTRY:
+        p_classes = entry.get("match_processor_classes", set())
+        if proc_class and proc_class in p_classes:
+            selected_entry = entry
+            match_source = f"processor_class '{proc_class}'"
+            break
+
+    # Precedence 2: model_type or architectures
+    if selected_entry is None:
+        for entry in PROCESSOR_DEPENDENCY_REGISTRY:
+            if model_type and model_type in entry.get("match_model_types", set()):
+                selected_entry = entry
+                match_source = f"model_type '{model_type}'"
+                break
+            arch_match = any(
+                any(re.match(pat, a) for pat in entry.get("match_architectures", []))
+                for a in archs
+            )
+            if arch_match:
+                selected_entry = entry
+                match_source = f"architectures '{archs}'"
+                break
+
+    # Precedence 3: model_id pattern
+    if selected_entry is None:
+        for entry in PROCESSOR_DEPENDENCY_REGISTRY:
+            if model_id and any(
+                re.match(pat, model_id) for pat in entry.get("match_model_id_patterns", [])
+            ):
+                selected_entry = entry
+                match_source = f"model_id '{model_id}'"
+                break
+
+    discovered_packages: List[Dict[str, Any]] = []
+    if selected_entry:
+        for pkg in selected_entry.get("packages", []):
+            discovered_packages.append(
+                {
+                    "pip_name": pkg["pip_name"],
+                    "import_name": pkg["import_name"],
+                    "reason": pkg.get("reason", "Required processor dependency"),
+                    "required_by": f"{selected_entry['id']} via {match_source}",
+                }
+            )
+
+    # Add extra packages from argument or environment (EXTRA_PIP_PACKAGES)
+    env_extra = os.environ.get("EXTRA_PIP_PACKAGES", "")
+    combined_extra: List[str] = []
+    if extra_packages:
+        combined_extra.extend(extra_packages)
+    if env_extra.strip():
+        combined_extra.extend(re.split(r"[,\s]+", env_extra.strip()))
+
+    for ep in combined_extra:
+        ep_clean = ep.strip()
+        if ep_clean and not any(p["pip_name"] == ep_clean for p in discovered_packages):
+            discovered_packages.append(
+                {
+                    "pip_name": ep_clean,
+                    "import_name": ep_clean,
+                    "reason": "User specified extra runtime package via EXTRA_PIP_PACKAGES",
+                    "required_by": "user_override",
+                }
+            )
+
+    # Check status of each package
+    required_packages: List[str] = []
+    missing_packages: List[str] = []
+    installed_packages: List[str] = []
+    details: List[Dict[str, Any]] = []
+
+    for pkg_info in discovered_packages:
+        pip_name = pkg_info["pip_name"]
+        import_name = pkg_info["import_name"]
+        installed = is_package_installed(import_name)
+
+        if pip_name not in required_packages:
+            required_packages.append(pip_name)
+        if installed:
+            if pip_name not in installed_packages:
+                installed_packages.append(pip_name)
+        else:
+            if pip_name not in missing_packages:
+                missing_packages.append(pip_name)
+
+        details.append(
+            {
+                "pip_name": pip_name,
+                "import_name": import_name,
+                "installed": installed,
+                "required_by": pkg_info.get("required_by", "model_metadata"),
+                "reason": pkg_info.get("reason", ""),
+            }
+        )
+
+    bootstrap_cmd = (
+        ["pip", "install", "-q", "--no-cache-dir", *missing_packages]
+        if missing_packages
+        else []
+    )
+
+    return {
+        "required_packages": required_packages,
+        "missing_packages": missing_packages,
+        "installed_packages": installed_packages,
+        "details": details,
+        "bootstrap_command": bootstrap_cmd,
+    }
 
 
 def parse_semver(ver_str: str) -> Tuple[int, ...]:
@@ -1187,6 +1367,31 @@ def fetch_hf_model_metadata(
     if tokenizer_config is not None:
         model_info["tokenizer_config"] = tokenizer_config
 
+    # 4. Fetch processor_config.json and preprocessor_config.json for multimodal models
+    processor_config = None
+    proc_url = f"https://huggingface.co/{model_id}/raw/main/processor_config.json"
+    proc_req = urllib.request.Request(proc_url, headers=headers)
+    try:
+        with urllib.request.urlopen(proc_req, timeout=8) as proc_resp:
+            processor_config = json.loads(proc_resp.read().decode("utf-8"))
+    except Exception:
+        processor_config = None
+
+    if processor_config is not None:
+        model_info["processor_config"] = processor_config
+
+    preprocessor_config = None
+    preproc_url = f"https://huggingface.co/{model_id}/raw/main/preprocessor_config.json"
+    preproc_req = urllib.request.Request(preproc_url, headers=headers)
+    try:
+        with urllib.request.urlopen(preproc_req, timeout=8) as preproc_resp:
+            preprocessor_config = json.loads(preproc_resp.read().decode("utf-8"))
+    except Exception:
+        preprocessor_config = None
+
+    if preprocessor_config is not None:
+        model_info["preprocessor_config"] = preprocessor_config
+
     return model_info, config
 
 
@@ -1230,6 +1435,26 @@ def extract_attention_dimensions(config: Dict[str, Any]) -> Dict[str, Any]:
     heads = _lookup(target_cfg, ["num_attention_heads", "n_head", "num_heads"])
     if heads is None:
         heads = _lookup(text_cfg, ["num_attention_heads", "n_head", "num_heads"])
+
+    h_size = _lookup(target_cfg, ["hidden_size", "n_embd", "d_model"])
+    if h_size is None:
+        h_size = _lookup(text_cfg, ["hidden_size", "n_embd", "d_model"])
+    res["hidden_size"] = h_size
+
+    h_dim = _lookup(target_cfg, ["head_dim"])
+    if h_dim is None:
+        h_dim = _lookup(text_cfg, ["head_dim"])
+
+    # Generic attention head fallback: explicit num_attention_heads > hidden_size // head_dim when divisible > unknown
+    if (
+        heads is None
+        and h_size is not None
+        and h_dim is not None
+        and h_dim > 0
+        and (h_size % h_dim == 0)
+    ):
+        heads = h_size // h_dim
+
     res["num_attention_heads"] = heads
 
     kv_heads = _lookup(
@@ -1243,15 +1468,13 @@ def extract_attention_dimensions(config: Dict[str, Any]) -> Dict[str, Any]:
         kv_heads = heads
     res["num_key_value_heads"] = kv_heads
 
-    h_size = _lookup(target_cfg, ["hidden_size", "n_embd", "d_model"])
-    if h_size is None:
-        h_size = _lookup(text_cfg, ["hidden_size", "n_embd", "d_model"])
-    res["hidden_size"] = h_size
-
-    h_dim = _lookup(target_cfg, ["head_dim"])
-    if h_dim is None:
-        h_dim = _lookup(text_cfg, ["head_dim"])
-    if h_dim is None and h_size is not None and heads is not None and heads > 0:
+    if (
+        h_dim is None
+        and h_size is not None
+        and heads is not None
+        and heads > 0
+        and (h_size % heads == 0)
+    ):
         h_dim = h_size // heads
     res["head_dim"] = h_dim
 
@@ -1397,6 +1620,32 @@ def inspect_model_attributes(
     attrs["has_chat_template"] = has_chat_template
     attrs["chat_template_desc"] = chat_template_desc
     attrs["tokenizer_config"] = tok_cfg
+
+    # Processor metadata extraction (strongest signal for multimodal dependencies)
+    proc_cfg = model_info.get("processor_config") or config.get("processor_config")
+    preproc_cfg = model_info.get("preprocessor_config") or config.get("preprocessor_config")
+
+    processor_class = None
+    image_processor_type = None
+
+    if isinstance(proc_cfg, dict):
+        processor_class = proc_cfg.get("processor_class")
+    if not processor_class and isinstance(preproc_cfg, dict):
+        processor_class = preproc_cfg.get("processor_class")
+    if not processor_class and isinstance(config, dict):
+        processor_class = config.get("processor_class")
+
+    if isinstance(preproc_cfg, dict):
+        image_processor_type = preproc_cfg.get("image_processor_type")
+    if not image_processor_type and isinstance(proc_cfg, dict):
+        image_processor_type = proc_cfg.get("image_processor_type")
+    if not image_processor_type and isinstance(config, dict):
+        image_processor_type = config.get("image_processor_type")
+
+    attrs["processor_config"] = proc_cfg
+    attrs["preprocessor_config"] = preproc_cfg
+    attrs["processor_class"] = processor_class
+    attrs["image_processor_type"] = image_processor_type
 
     return attrs
 
@@ -1934,6 +2183,8 @@ def recommend_configuration(
         attrs=attrs,
     )
 
+    deps = resolve_model_dependencies(attrs)
+
     return {
         "status": "CANDIDATE_RECOMMENDED",
         "model_id": model_id,
@@ -1956,6 +2207,10 @@ def recommend_configuration(
         "command_args": cmd_args,
         "command_str": " ".join(f"'{a}'" if " " in a else a for a in cmd_args),
         "vllm_version_check": vllm_compat,
+        "dependencies": deps,
+        "required_packages": deps.get("required_packages", []),
+        "missing_packages": deps.get("missing_packages", []),
+        "package_bootstrap_cmd": deps.get("bootstrap_command", []),
         "memory_breakdown": {
             "estimated_components": mem_est,
             "per_gpu_workload_gb": {
@@ -2268,10 +2523,33 @@ def print_diagnostic_report(
     p(" [5] Generated vLLM Execution Command\n")
     p(f"     {resolved.get('command_str')}\n\n")
 
-    # Section 6: Smoke Test Inference Plan
+    # Section 6: Processor & Runtime Dependencies
+    deps = resolved.get("dependencies", {})
+    req_pkgs = deps.get("required_packages", [])
+    if req_pkgs or attrs.get("processor_class"):
+        p(" [6] Processor & Runtime Dependencies\n")
+        if attrs.get("processor_class"):
+            p(f"     Processor Class:   {attrs.get('processor_class')}\n")
+        if attrs.get("image_processor_type"):
+            p(f"     Image Processor:   {attrs.get('image_processor_type')}\n")
+        if req_pkgs:
+            p(f"     Required Packages: {', '.join(req_pkgs)}\n")
+            for d in deps.get("details", []):
+                pkg_name = d["pip_name"]
+                stat = "INSTALLED" if d.get("installed") else "MISSING"
+                p(f"       - {pkg_name:<16} [{stat}] ({d.get('reason', '')})\n")
+            miss_pkgs = deps.get("missing_packages", [])
+            if miss_pkgs:
+                p(f"\n     [ACTION REQUIRED] Missing packages detected: {', '.join(miss_pkgs)}\n")
+                p(f"     Remediation:       Run './infra/kaggle/vllm.sh bootstrap' or 'pip install {' '.join(miss_pkgs)}'\n")
+        else:
+            p("     Required Packages: None (Standard runtime dependencies satisfied)\n")
+        p("\n")
+
+    # Section 7: Smoke Test Inference Plan
     plan = resolved.get("inference_test_plan", {})
     if plan:
-        p(" [6] Smoke Test Inference Plan\n")
+        p(" [7] Smoke Test Inference Plan\n")
         p(f"     Test API:          {plan.get('test_api')}\n")
         p(f"     Reason:            {plan.get('reason')}\n")
         p(f"     Target Endpoint:   {plan.get('endpoint')}\n\n")

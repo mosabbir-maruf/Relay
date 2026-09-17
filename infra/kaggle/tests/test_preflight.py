@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -1519,6 +1520,388 @@ MODEL=gpt2
         self.assertFalse(ready)
         self.assertIn("MODEL_NOT_FOUND", msg)
         self.assertIn("expected model 'gpt2' not found", msg)
+
+
+class TestProcessorDependencies(unittest.TestCase):
+    """
+    Tests for generic model-runtime dependency resolution and bootstrap behavior.
+    Enforces that:
+      - SmolVLM/SmolVLM2 resolves num2words as required
+      - Idefics/Idefics3 does NOT guess or inherit num2words
+      - GPT-2 and text models have no extra processor dependencies
+      - Matching precedence strictly honors processor_class > architecture/model_type > model_id
+      - Attention head fallback divides when divisible and leaves unknown when not
+      - Extra user packages via EXTRA_PIP_PACKAGES are respected
+      - Package installed vs missing reporting is accurate
+    """
+
+    def setUp(self):
+        self.mock_t4_gpu = {
+            "available": True,
+            "count": 2,
+            "devices": [
+                {"index": 0, "name": "Tesla T4", "memory_mb": 15109.0},
+                {"index": 1, "name": "Tesla T4", "memory_mb": 15109.0},
+            ],
+            "total_vram_gb": 29.51,
+            "is_tesla_t4": True,
+        }
+
+    def test_smolvlm_processor_requires_num2words(self):
+        """SmolVLM processor metadata resolves num2words in required_packages."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "model_type": "smolvlm",
+            "architectures": ["SmolVLMForConditionalGeneration"],
+            "processor_class": "SmolVLMProcessor",
+            "image_processor_type": "SmolVLMImageProcessor",
+        }
+        deps = preflight.resolve_model_dependencies(attrs)
+        self.assertIn("num2words", deps["required_packages"])
+        # Do not assume num2words is missing in the host environment;
+        # assert that status is consistently classified as installed or missing
+        self.assertTrue(
+            "num2words" in deps["missing_packages"]
+            or "num2words" in deps["installed_packages"]
+        )
+
+    def test_smolvlm_via_architecture_or_model_type_requires_num2words(self):
+        """Even without processor_class, smolvlm architecture or model_type matches num2words."""
+        attrs = {
+            "model_id": "community/fine-tuned-smolvlm",
+            "model_type": "smolvlm",
+            "architectures": ["SmolVLMForConditionalGeneration"],
+        }
+        deps = preflight.resolve_model_dependencies(attrs)
+        self.assertIn("num2words", deps["required_packages"])
+
+    def test_generic_idefics3_does_not_require_num2words(self):
+        """Generic Idefics3 must NOT inherit num2words."""
+        attrs = {
+            "model_id": "HuggingFaceM4/Idefics3-8B-Llama3",
+            "model_type": "idefics3",
+            "architectures": ["Idefics3ForConditionalGeneration"],
+            "processor_class": "Idefics3Processor",
+        }
+        deps = preflight.resolve_model_dependencies(attrs)
+        self.assertEqual(deps["required_packages"], [])
+        self.assertEqual(deps["missing_packages"], [])
+
+    def test_gpt2_text_model_requires_no_extra_dependencies(self):
+        """Causal text models require zero additional processor dependencies."""
+        attrs = {
+            "model_id": "openai-community/gpt2",
+            "model_type": "gpt2",
+            "architectures": ["GPT2LMHeadModel"],
+        }
+        deps = preflight.resolve_model_dependencies(attrs)
+        self.assertEqual(deps["required_packages"], [])
+        self.assertEqual(deps["missing_packages"], [])
+
+    def test_precedence_processor_class_over_model_type_and_id(self):
+        """Processor metadata has highest precedence over model type and ID."""
+        # Ambiguous model_id and model_type, but explicit SmolVLMProcessor class
+        attrs = {
+            "model_id": "custom-org/my-vision-model",
+            "model_type": "custom_vlm",
+            "architectures": ["CustomConditionalGeneration"],
+            "processor_class": "SmolVLMProcessor",
+        }
+        deps = preflight.resolve_model_dependencies(attrs)
+        self.assertIn("num2words", deps["required_packages"])
+
+    def test_generic_attention_head_calculation(self):
+        """Attention head fallback: explicit > hidden_size // head_dim when divisible > unknown."""
+        # 1. Divisible case (e.g. SmolVLM2: 2048 // 64 = 32)
+        cfg_divisible = {
+            "num_hidden_layers": 24,
+            "hidden_size": 2048,
+            "head_dim": 64,
+        }
+        dims = preflight.extract_attention_dimensions(cfg_divisible)
+        self.assertEqual(dims["num_attention_heads"], 32)
+        self.assertEqual(dims["num_key_value_heads"], 32)
+        self.assertEqual(dims["head_dim"], 64)
+        self.assertEqual(dims["source"], "hf_config")
+
+        # 2. Non-divisible case -> leaves unknown (None)
+        cfg_non_divisible = {
+            "num_hidden_layers": 24,
+            "hidden_size": 2000,
+            "head_dim": 64,
+        }
+        dims_non_div = preflight.extract_attention_dimensions(cfg_non_divisible)
+        self.assertIsNone(dims_non_div["num_attention_heads"])
+
+        # 3. Explicit num_attention_heads takes precedence
+        cfg_explicit = {
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "hidden_size": 2048,
+            "head_dim": 64,
+        }
+        dims_exp = preflight.extract_attention_dimensions(cfg_explicit)
+        self.assertEqual(dims_exp["num_attention_heads"], 16)
+
+    def test_extra_pip_packages_user_override(self):
+        """User can specify additional packages via EXTRA_PIP_PACKAGES or extra_packages argument."""
+        attrs = {
+            "model_id": "openai-community/gpt2",
+            "model_type": "gpt2",
+            "architectures": ["GPT2LMHeadModel"],
+        }
+        with mock.patch.dict(os.environ, {"EXTRA_PIP_PACKAGES": "custom-pkg another-pkg"}):
+            deps = preflight.resolve_model_dependencies(attrs)
+            self.assertIn("custom-pkg", deps["required_packages"])
+            self.assertIn("another-pkg", deps["required_packages"])
+
+    def test_dependency_status_reporting_mocked(self):
+        """Accurately classifies missing vs installed packages when presence is mocked."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_class": "SmolVLMProcessor",
+        }
+        # Case A: package missing
+        with mock.patch("preflight.is_package_installed", return_value=False):
+            deps = preflight.resolve_model_dependencies(attrs)
+            self.assertEqual(deps["missing_packages"], ["num2words"])
+            self.assertEqual(deps["installed_packages"], [])
+            self.assertEqual(
+                deps["bootstrap_command"],
+                ["pip", "install", "-q", "--no-cache-dir", "num2words"],
+            )
+
+        # Case B: package installed
+        with mock.patch("preflight.is_package_installed", return_value=True):
+            deps = preflight.resolve_model_dependencies(attrs)
+            self.assertEqual(deps["missing_packages"], [])
+            self.assertEqual(deps["installed_packages"], ["num2words"])
+            self.assertEqual(deps["bootstrap_command"], [])
+
+    def test_generic_idefics_and_idefics2_do_not_require_num2words(self):
+        """Generic Idefics and Idefics2 architectures and processors do NOT require num2words."""
+        # Test Idefics 1
+        attrs_idefics1 = {
+            "model_id": "HuggingFaceM4/idefics-9b",
+            "model_type": "idefics",
+            "architectures": ["IdeficsForVisionText2Text"],
+            "processor_class": "IdeficsProcessor",
+        }
+        deps1 = preflight.resolve_model_dependencies(attrs_idefics1)
+        self.assertNotIn("num2words", deps1["required_packages"])
+        self.assertEqual(deps1["required_packages"], [])
+
+        # Test Idefics 2
+        attrs_idefics2 = {
+            "model_id": "HuggingFaceM4/idefics2-8b",
+            "model_type": "idefics2",
+            "architectures": ["Idefics2ForConditionalGeneration"],
+            "processor_class": "Idefics2Processor",
+        }
+        deps2 = preflight.resolve_model_dependencies(attrs_idefics2)
+        self.assertNotIn("num2words", deps2["required_packages"])
+        self.assertEqual(deps2["required_packages"], [])
+
+    def test_already_installed_package_not_reported_as_missing(self):
+        """An already-installed package is recorded in installed_packages and NOT in missing_packages."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_class": "SmolVLMProcessor",
+        }
+        with mock.patch("preflight.is_package_installed", return_value=True):
+            deps = preflight.resolve_model_dependencies(attrs)
+            self.assertIn("num2words", deps["installed_packages"])
+            self.assertNotIn("num2words", deps["missing_packages"])
+            self.assertEqual(deps["missing_packages"], [])
+            self.assertEqual(deps["bootstrap_command"], [])
+
+    def test_missing_package_reported_as_missing(self):
+        """A missing package is recorded in missing_packages and NOT in installed_packages."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_class": "SmolVLMProcessor",
+        }
+        with mock.patch("preflight.is_package_installed", return_value=False):
+            deps = preflight.resolve_model_dependencies(attrs)
+            self.assertIn("num2words", deps["missing_packages"])
+            self.assertNotIn("num2words", deps["installed_packages"])
+            self.assertEqual(
+                deps["bootstrap_command"],
+                ["pip", "install", "-q", "--no-cache-dir", "num2words"],
+            )
+
+    def test_bootstrap_installs_only_missing_packages(self):
+        """Bootstrap command and missing_packages only include packages not yet installed."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_class": "SmolVLMProcessor",
+        }
+        with mock.patch.dict(os.environ, {"EXTRA_PIP_PACKAGES": "present-dep missing-dep"}):
+            def mock_installed(pkg_name):
+                return pkg_name in ("num2words", "present-dep")
+
+            with mock.patch("preflight.is_package_installed", side_effect=mock_installed):
+                deps = preflight.resolve_model_dependencies(attrs)
+                self.assertIn("num2words", deps["installed_packages"])
+                self.assertIn("present-dep", deps["installed_packages"])
+                self.assertEqual(deps["missing_packages"], ["missing-dep"])
+                self.assertEqual(
+                    deps["bootstrap_command"],
+                    ["pip", "install", "-q", "--no-cache-dir", "missing-dep"],
+                )
+
+    def test_repeated_bootstrap_is_idempotent(self):
+        """Repeated bootstrap is idempotent: once installed, missing_packages becomes empty."""
+        attrs = {
+            "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_class": "SmolVLMProcessor",
+        }
+        # First execution: package is missing
+        with mock.patch("preflight.is_package_installed", return_value=False):
+            deps_step1 = preflight.resolve_model_dependencies(attrs)
+            self.assertEqual(deps_step1["missing_packages"], ["num2words"])
+            self.assertEqual(
+                deps_step1["bootstrap_command"],
+                ["pip", "install", "-q", "--no-cache-dir", "num2words"],
+            )
+
+        # Second execution: package has been installed by bootstrap
+        with mock.patch("preflight.is_package_installed", return_value=True):
+            deps_step2 = preflight.resolve_model_dependencies(attrs)
+            self.assertEqual(deps_step2["missing_packages"], [])
+            self.assertEqual(deps_step2["bootstrap_command"], [])
+            self.assertIn("num2words", deps_step2["installed_packages"])
+
+    def test_pip_failure_exits_nonzero_and_is_not_suppressed(self):
+        """vllm.sh bootstrap fails with non-zero exit code (1) when pip install fails."""
+        vllm_sh = os.path.join(KAGGLE_DIR, "vllm.sh")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a mock failing pip binary
+            fake_pip = os.path.join(tmpdir, "pip")
+            with open(fake_pip, "w") as f:
+                f.write("#!/bin/sh\necho 'Mock pip error: network down' >&2\nexit 1\n")
+            os.chmod(fake_pip, 0o755)
+
+            # Create a mock preflight reporting num2words missing
+            fake_preflight = os.path.join(tmpdir, "preflight.py")
+            with open(fake_preflight, "w") as f:
+                f.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    "if '--json' in sys.argv:\n"
+                    "    print(json.dumps({'missing_packages': ['num2words']}))\n"
+                    "    sys.exit(0)\n"
+                    "sys.exit(0)\n"
+                )
+            os.chmod(fake_preflight, 0o755)
+
+            env = {
+                **os.environ,
+                "PATH": f"{tmpdir}:{os.environ.get('PATH', '')}",
+                "MODEL_ID": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+                "SCRIPT_DIR": tmpdir,
+                "WORK_DIR": tmpdir,
+            }
+
+            cmd = ["bash", vllm_sh, "bootstrap"]
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 1, "bootstrap_deps must exit with code 1 on pip failure")
+            output = res.stderr + res.stdout
+            self.assertIn("Failed to install processor dependencies", output)
+            self.assertIn("Mock pip error", output)
+
+    def test_vllm_bootstrap_success_and_idempotency_via_shell(self):
+        """vllm.sh bootstrap installs dependencies once and does not re-invoke pip when satisfied."""
+        vllm_sh = os.path.join(KAGGLE_DIR, "vllm.sh")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pip_log = os.path.join(tmpdir, "pip_calls.txt")
+            fake_pip = os.path.join(tmpdir, "pip")
+            with open(fake_pip, "w") as f:
+                f.write(f"#!/bin/sh\necho \"$@\" >> '{pip_log}'\nexit 0\n")
+            os.chmod(fake_pip, 0o755)
+
+            flag_file = os.path.join(tmpdir, "installed.flag")
+            fake_preflight = os.path.join(tmpdir, "preflight.py")
+            with open(fake_preflight, "w") as f:
+                f.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys, os\n"
+                    "if '--json' in sys.argv:\n"
+                    f"    if os.path.exists('{flag_file}'):\n"
+                    "        print(json.dumps({'missing_packages': []}))\n"
+                    "    else:\n"
+                    "        print(json.dumps({'missing_packages': ['num2words']}))\n"
+                    "    sys.exit(0)\n"
+                    "sys.exit(0)\n"
+                )
+            os.chmod(fake_preflight, 0o755)
+
+            env = {
+                **os.environ,
+                "PATH": f"{tmpdir}:{os.environ.get('PATH', '')}",
+                "MODEL_ID": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+                "SCRIPT_DIR": tmpdir,
+                "WORK_DIR": tmpdir,
+            }
+
+            cmd = ["bash", vllm_sh, "bootstrap"]
+
+            # Run 1: installs num2words
+            res1 = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(res1.returncode, 0)
+            self.assertIn("Successfully installed processor dependencies", res1.stdout)
+            with open(pip_log, "r") as f:
+                lines1 = f.readlines()
+            self.assertEqual(len(lines1), 1)
+            self.assertIn("num2words", lines1[0])
+
+            # Simulate installation complete for Step 2
+            with open(flag_file, "w") as f:
+                f.write("done\n")
+
+            # Run 2: already satisfied, pip is NOT invoked again
+            res2 = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(res2.returncode, 0)
+            self.assertIn("All required model processor dependencies are already satisfied", res2.stdout)
+            with open(pip_log, "r") as f:
+                lines2 = f.readlines()
+            self.assertEqual(len(lines2), 1, "pip must not be invoked again on repeated bootstrap")
+
+    def test_smolvlm2_candidate_recommendation_offline(self):
+        """SmolVLM2 candidate recommendation includes dependencies and multimodal plan."""
+        config = {
+            "architectures": ["SmolVLMForConditionalGeneration"],
+            "model_type": "smolvlm",
+            "image_token_id": 49190,
+            "vision_config": {"longest_edge": 384},
+            "text_config": {
+                "num_hidden_layers": 24,
+                "hidden_size": 2048,
+                "head_dim": 64,
+                "max_position_embeddings": 8192,
+                "torch_dtype": "bfloat16",
+            },
+        }
+        model_info = {
+            "id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+            "processor_config": {"processor_class": "SmolVLMProcessor"},
+            "preprocessor_config": {"image_processor_type": "SmolVLMImageProcessor"},
+        }
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        attrs["param_count"] = 2_200_000_000
+
+        resolved = preflight.resolve_configuration(
+            "HuggingFaceTB/SmolVLM2-2.2B-Instruct", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertEqual(resolved["model_kind"], "multimodal_causal_lm")
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+        self.assertEqual(resolved["dtype"], "float16")
+        self.assertEqual(resolved["max_model_len"], 4096)
+        self.assertTrue(resolved["inference_test_plan"]["is_multimodal"])
+        self.assertIn("num2words", resolved["required_packages"])
+        self.assertIn("dependencies", resolved)
+        self.assertIn("missing_packages", resolved)
 
 
 if __name__ == "__main__":

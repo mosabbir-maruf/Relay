@@ -8,6 +8,7 @@
 # Supported Commands:
 #   ./vllm.sh check      - Validate prerequisites, GPUs, vLLM, and port 8000
 #   ./vllm.sh preflight  - Inspect target HF model & validate T4 compatibility
+#   ./vllm.sh bootstrap  - Install required processor dependencies for MODEL_ID
 #   ./vllm.sh clean      - Safely clean up stale vLLM processes on port 8000
 #   ./vllm.sh start      - Resolve config & launch vLLM in background
 #   ./vllm.sh status     - Check process status and endpoint readiness
@@ -18,7 +19,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 WORK_DIR="${WORK_DIR:-/kaggle/working}"
 LOG_FILE="${WORK_DIR}/vllm_server.log"
 PID_FILE="${WORK_DIR}/vllm.pid"
@@ -79,6 +80,40 @@ run_preflight() {
   fi
 
   python3 "${SCRIPT_DIR}/preflight.py"
+}
+
+bootstrap_deps() {
+  if [ -z "${MODEL_ID:-}" ]; then
+    echo "ERROR: MODEL_ID environment variable is not set." >&2
+    echo "Example: export MODEL_ID='HuggingFaceTB/SmolVLM2-2.2B-Instruct'" >&2
+    return 1
+  fi
+
+  echo "Resolving model processor dependencies for ${MODEL_ID}..."
+  local preflight_json
+  if ! preflight_json=$(python3 "${SCRIPT_DIR}/preflight.py" --json); then
+    echo "ERROR: Preflight validation failed during dependency resolution!" >&2
+    echo "${preflight_json}" >&2
+    return 1
+  fi
+
+  local missing_deps
+  missing_deps=$(echo "${preflight_json}" | python3 -c "import sys, json
+data = json.load(sys.stdin)
+pkgs = data.get('missing_packages', [])
+print(' '.join(pkgs))
+")
+
+  if [ -n "${missing_deps}" ]; then
+    echo "Bootstrapping required model processor dependencies: ${missing_deps}..."
+    if ! pip install -q --no-cache-dir ${missing_deps}; then
+      echo "ERROR: Failed to install processor dependencies: ${missing_deps}" >&2
+      return 1
+    fi
+    echo "Successfully installed processor dependencies: ${missing_deps}"
+  else
+    echo "All required model processor dependencies are already satisfied."
+  fi
 }
 
 clean_stale() {
@@ -202,6 +237,23 @@ for a in data.get('command_args', []):
   mkdir -p "${WORK_DIR}"
   echo "${preflight_json}" > "${WORK_DIR}/resolved_config.json"
   echo "${served_name}" > "${WORK_DIR}/served_model_name.txt"
+
+  # Check and bootstrap required processor dependencies if missing before launch
+  local missing_deps
+  missing_deps=$(echo "${preflight_json}" | python3 -c "import sys, json
+data = json.load(sys.stdin)
+pkgs = data.get('missing_packages', [])
+print(' '.join(pkgs))
+")
+  if [ -n "${missing_deps}" ]; then
+    echo "Bootstrapping required model processor dependencies before launch: ${missing_deps}..."
+    if ! pip install -q --no-cache-dir ${missing_deps}; then
+      echo "ERROR: Failed to bootstrap required processor dependencies (${missing_deps}). Cannot launch vLLM." >&2
+      return 1
+    fi
+    echo "Processor dependencies installed successfully. Proceeding with vLLM launch..."
+  fi
+
   echo "Launching vLLM in background..."
   echo "Model ID:    ${MODEL_ID}"
   echo "Served Name: ${served_name}"
@@ -458,6 +510,9 @@ case "${1:-status}" in
   preflight)
     run_preflight
     ;;
+  bootstrap)
+    bootstrap_deps
+    ;;
   clean)
     clean_stale
     ;;
@@ -477,7 +532,7 @@ case "${1:-status}" in
     show_logs "${@}"
     ;;
   *)
-    echo "Usage: $0 {check|preflight|clean|start|status|test|logs [N]|stop}"
+    echo "Usage: $0 {check|preflight|bootstrap|clean|start|status|test|logs [N]|stop}"
     exit 1
     ;;
 esac
