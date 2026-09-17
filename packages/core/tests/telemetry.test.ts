@@ -44,4 +44,25 @@ describe('Telemetry & UsageRecord', () => {
 
     expect(() => sink.record(record)).not.toThrow();
   });
+
+  it('enforces maxRecords capacity bounding and evicts oldest records', () => {
+    const sink = new InMemoryUsageSink({ maxRecords: 3 });
+
+    for (let i = 1; i <= 5; i++) {
+      sink.record({
+        requestId: `req-${i}`,
+        provider: 'qwen',
+        model: 'qwen3-coder-30b',
+        stream: false,
+        startedAt: new Date(),
+        durationMs: 100,
+        statusCode: 200,
+        success: true,
+      });
+    }
+
+    const records = sink.getRecords();
+    expect(records).toHaveLength(3);
+    expect(records.map((r) => r.requestId)).toEqual(['req-3', 'req-4', 'req-5']);
+  });
 });

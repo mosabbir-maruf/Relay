@@ -16,13 +16,21 @@ export class ProviderRegistry {
   private readonly modelsByQualifiedName = new Map<string, ModelInfo>();
   private readonly ambiguousModelProviders = new Map<string, Set<string>>();
 
-  // Cached health check state to prevent upstream request hammering
+  // Cached health check state and in-flight coalescing to prevent upstream hammering
   private cachedHealth: Record<string, ProviderHealth> | null = null;
+  private inFlightHealthCheck: Promise<Record<string, ProviderHealth>> | null = null;
   private lastHealthCheckTime = 0;
   private readonly healthCacheTtlMs = 15000;
+  private registryVersion = 0;
+
+  getVersion(): number {
+    return this.registryVersion;
+  }
 
   registerProvider(provider: LLMProvider): void {
     this.providers.set(provider.id, provider);
+    this.cachedHealth = null;
+    this.registryVersion++;
   }
 
   getProvider(providerId: string): LLMProvider | undefined {
@@ -35,6 +43,9 @@ export class ProviderRegistry {
         `Cannot register model "${modelInfo.id}": provider "${modelInfo.provider}" has not been registered.`,
       );
     }
+
+    this.cachedHealth = null;
+    this.registryVersion++;
 
     // Always register under qualified name: "provider/modelId"
     const qualifiedName = `${modelInfo.provider}/${modelInfo.id}`;
@@ -123,24 +134,37 @@ export class ProviderRegistry {
       return this.cachedHealth;
     }
 
-    const results: Record<string, ProviderHealth> = {};
-    const checks = Array.from(this.providers.entries()).map(async ([id, provider]) => {
-      try {
-        const health = await provider.healthCheck();
-        results[id] = health;
-      } catch (err) {
-        results[id] = {
-          isHealthy: false,
-          latencyMs: 0,
-          lastChecked: new Date(),
-          errorMessage: err instanceof Error ? err.message : String(err),
-        };
-      }
-    });
+    // Coalesce concurrent health check calls into a single in-flight Promise
+    if (this.inFlightHealthCheck) {
+      return this.inFlightHealthCheck;
+    }
 
-    await Promise.all(checks);
-    this.cachedHealth = results;
-    this.lastHealthCheckTime = now;
-    return results;
+    this.inFlightHealthCheck = (async () => {
+      try {
+        const results: Record<string, ProviderHealth> = {};
+        const checks = Array.from(this.providers.entries()).map(async ([id, provider]) => {
+          try {
+            const health = await provider.healthCheck();
+            results[id] = health;
+          } catch (err) {
+            results[id] = {
+              isHealthy: false,
+              latencyMs: 0,
+              lastChecked: new Date(),
+              errorMessage: err instanceof Error ? err.message : String(err),
+            };
+          }
+        });
+
+        await Promise.all(checks);
+        this.cachedHealth = results;
+        this.lastHealthCheckTime = Date.now();
+        return results;
+      } finally {
+        this.inFlightHealthCheck = null;
+      }
+    })();
+
+    return this.inFlightHealthCheck;
   }
 }

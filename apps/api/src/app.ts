@@ -19,6 +19,8 @@ import { registerRequestIdHook } from './hooks/request-id.js';
 import { createChatRoutes } from './routes/chat.js';
 import { createHealthRoutes } from './routes/health.js';
 import { createModelsRoutes } from './routes/models.js';
+import { createPlaygroundRoutes } from './routes/playground.js';
+import { getNormalizedPath } from './utils/path.js';
 
 export interface AppFactoryOptions {
   readonly config: RelayConfig;
@@ -108,9 +110,12 @@ export async function createApp(options: AppFactoryOptions): Promise<FastifyInst
   });
 
   app.addHook('preHandler', async (request, reply) => {
-    const rawPath = request.url.split('?')[0] ?? '';
-    const normalizedPath = rawPath.replace(/\/+$/, '') || '/';
-    if (normalizedPath === '/health') {
+    const normalizedPath = getNormalizedPath(request.url);
+    if (
+      normalizedPath === '/health' ||
+      normalizedPath === '/playground' ||
+      normalizedPath.startsWith('/playground/')
+    ) {
       return;
     }
     await authHandler(request);
@@ -119,8 +124,7 @@ export async function createApp(options: AppFactoryOptions): Promise<FastifyInst
 
   // Fallback telemetry hook: captures early failures (e.g. 401 auth, 413 payload limit, 429 rate limit) outside chat handler
   app.addHook('onResponse', async (request, reply) => {
-    const rawPath = request.url.split('?')[0] ?? '';
-    const normalizedPath = rawPath.replace(/\/+$/, '') || '/';
+    const normalizedPath = getNormalizedPath(request.url);
     if (normalizedPath === '/v1/chat/completions' && request.method === 'POST') {
       const handledInRoute = Boolean(
         (request as { inChatHandler?: boolean }).inChatHandler ||
@@ -158,6 +162,7 @@ export async function createApp(options: AppFactoryOptions): Promise<FastifyInst
   });
 
   // Register core routes
+  await app.register(createPlaygroundRoutes());
   await app.register(createHealthRoutes({ registry: options.registry }));
   await app.register(createModelsRoutes({ registry: options.registry, router }));
   await app.register(

@@ -198,6 +198,86 @@ Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3
 
 ---
 
+## Browser AI Playground
+
+Relay includes a browser-based AI Playground built directly into the Fastify gateway at `/playground`. Built with vanilla TypeScript and ES modules—without the overhead or complexity of a frontend framework—it provides an interactive, dark-mode environment for prompt testing, model evaluation, and code generation directly through Relay's own OpenAI-compatible API.
+
+![Relay AI Playground](apps/api/public/playground.png)
+
+> Browser-based AI Playground running Qwen3-Coder through the Relay gateway.
+
+### Architecture Flow
+
+```
+Browser Playground
+        │
+        ▼  (Relative API: /v1/models, /v1/chat/completions, /health)
+  Relay Gateway
+        │
+        ▼  (SSRF Protection, Rate Limiting, Circuit Breaking)
+Configured Provider
+        │
+        ▼
+Qwen / vLLM / Gemini / OpenAI-Compatible Backend
+```
+
+For self-hosted Qwen deployments, the upstream backend can be a Qwen3-Coder vLLM server running on Kaggle and exposed through an encrypted Cloudflare Quick Tunnel. The browser communicates exclusively with Relay's ingress endpoints; upstream provider URLs and credentials are never exposed to the client.
+
+### Quick Start
+
+Start the development server:
+
+```bash
+pnpm dev
+```
+
+Then open your browser to:
+
+```text
+http://localhost:3000/playground
+```
+
+The Playground communicates with Relay using relative API paths:
+
+- `/v1/models` — Discovers configured models and capability metadata
+- `/v1/chat/completions` — Executes non-streaming and streaming completions
+- `/health` — Inspects live provider connectivity and latency
+
+The browser never calls `QWEN_BASE_URL` or upstream backends directly.
+
+### Configuration
+
+The Playground relies on Relay's server-side environment configuration in `.env` (see the [Environment Configuration](#environment-configuration) table below):
+
+```dotenv
+QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1
+QWEN_MODEL=qwen3-coder-30b
+```
+
+Upstream endpoint URLs and provider keys belong strictly in your local `.env` and are never hardcoded into client code. Cloudflare Quick Tunnel URLs are ephemeral and must be updated in `.env` whenever a new Kaggle session creates a new tunnel URL.
+
+### Security Boundaries
+
+- **UI Shell Isolation**: `/playground` serves the self-contained UI shell, while `/v1/*` endpoints maintain Relay's standard authentication behavior.
+- **Session-Only Credentials**: If `RELAY_API_KEY` is configured on the gateway, credentials can be entered in the Playground settings panel. The key is stored strictly in browser `sessionStorage` for that tab and is never saved to `localStorage` or disk.
+- **Zero Credential Exposure**: Server-side provider credentials (`GEMINI_API_KEY`, `QWEN_API_KEY`, upstream URLs) are never transmitted to or accessible from the browser.
+- **Strict Content Security Policy**: Enforces `connect-src 'self'`, `frame-ancestors 'none'`, and `base-uri 'none'` to restrict network egress exclusively to the Relay gateway and block framing/clickjacking attacks.
+
+### Feature Highlights
+
+| Feature               | Description                                                                                |
+| :-------------------- | :----------------------------------------------------------------------------------------- |
+| **Model Discovery**   | Automatically populates available models from `GET /v1/models`                             |
+| **Streaming Chat**    | Real-time Server-Sent Events (SSE) token streaming                                         |
+| **Cancellation**      | Instant abort of active generation via `AbortController`                                   |
+| **Health Status**     | Live connection status dot reflecting actual upstream backend reachability                 |
+| **Markdown & Code**   | Safe scoped Markdown rendering with syntax-highlighted code blocks and one-click copy      |
+| **Settings Controls** | Interactive controls for temperature, max tokens, system prompt, and streaming             |
+| **Local Persistence** | Conversation history stored locally in browser `localStorage` (bounded to recent messages) |
+| **Gateway Auth**      | Optional `RELAY_API_KEY` authentication supported via tab-scoped `sessionStorage`          |
+
+---
+
 ## Environment Configuration
 
 Configuration is validated at startup using Zod. The primary configuration options in `.env` are:

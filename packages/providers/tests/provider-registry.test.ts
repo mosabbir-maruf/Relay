@@ -149,4 +149,32 @@ describe('ProviderRegistry', () => {
     await registry.healthCheck({ forceRefresh: true });
     expect(callCount).toBe(2);
   });
+
+  it('coalesces concurrent health checks to prevent probe storms', async () => {
+    const registry = new ProviderRegistry();
+    let callCount = 0;
+    class SlowCountingProvider extends MockTestProvider {
+      override async healthCheck(): Promise<ProviderHealth> {
+        callCount++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return super.healthCheck();
+      }
+    }
+    registry.registerProvider(new SlowCountingProvider('slow-prov', 'Slow Provider'));
+
+    // Fire 5 concurrent health checks simultaneously
+    const promises = [
+      registry.healthCheck({ forceRefresh: true }),
+      registry.healthCheck({ forceRefresh: true }),
+      registry.healthCheck({ forceRefresh: true }),
+      registry.healthCheck({ forceRefresh: true }),
+      registry.healthCheck({ forceRefresh: true }),
+    ];
+
+    const results = await Promise.all(promises);
+    expect(callCount).toBe(1); // Exactly 1 provider healthCheck call!
+    for (const r of results) {
+      expect(r['slow-prov']?.isHealthy).toBe(true);
+    }
+  });
 });

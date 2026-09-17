@@ -48,7 +48,7 @@ export type {
 } from './errors/relay-error.js';
 
 // Telemetry & Observability
-export type { UsageRecord, UsageSink } from './telemetry/usage-record.js';
+export type { InMemoryUsageSinkOptions, UsageRecord, UsageSink } from './telemetry/usage-record.js';
 export { InMemoryUsageSink, NoopUsageSink } from './telemetry/usage-record.js';
 
 // Rate Limiting

@@ -215,4 +215,36 @@ describe('ModelRouter', () => {
     const plan = router.resolvePlan('many-fallbacks');
     expect(plan.fallbacks).toHaveLength(3);
   });
+
+  it('memoizes resolved routing plans and invalidates on registry mutation', () => {
+    const registry = setupRegistry();
+    const router = new ModelRouter({
+      registry,
+      policies: [{ model: 'cached-coder', primary: 'qwen3-coder-30b' }],
+    });
+
+    const plan1 = router.resolvePlan('cached-coder');
+    const plan2 = router.resolvePlan('cached-coder');
+    // Exact same cached reference (O(1) memoized return)
+    expect(plan2).toBe(plan1);
+
+    // Explicit cache clearing
+    router.clearCache();
+    const plan3 = router.resolvePlan('cached-coder');
+    expect(plan3).not.toBe(plan1);
+    expect(plan3.primary.modelInfo.id).toBe('qwen3-coder-30b');
+
+    // Registering a new model in registry increments registry version and invalidates cache
+    const qwen = registry.getProvider('qwen')!;
+    registry.registerModel({
+      id: 'new-model',
+      name: 'New Model',
+      provider: 'qwen',
+      capabilities: qwen.getCapabilities('qwen3-coder-30b'),
+    });
+
+    const plan4 = router.resolvePlan('cached-coder');
+    expect(plan4).not.toBe(plan3);
+    expect(plan4.primary.modelInfo.id).toBe('qwen3-coder-30b');
+  });
 });

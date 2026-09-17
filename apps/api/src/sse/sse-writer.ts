@@ -9,7 +9,7 @@ export interface SseStreamResult {
 }
 
 function formatSseChunk(chunk: ChatCompletionChunk): string {
-  const openAiChunk = {
+  const openAiChunk: Record<string, unknown> = {
     id: chunk.id,
     object: 'chat.completion.chunk',
     created: chunk.created,
@@ -21,8 +21,11 @@ function formatSseChunk(chunk: ChatCompletionChunk): string {
         finish_reason: chunk.finishReason,
       },
     ],
-    ...(chunk.usage ? { usage: chunk.usage } : {}),
   };
+
+  if (chunk.usage) {
+    openAiChunk['usage'] = chunk.usage;
+  }
 
   return `data: ${JSON.stringify(openAiChunk)}\n\n`;
 }
@@ -36,7 +39,8 @@ function formatSseChunk(chunk: ChatCompletionChunk): string {
  * 2. Collects token usage metadata from chunks if provided by upstream without buffering entire stream text.
  * 3. Emits standard OpenAI SSE error events if an error occurs mid-stream after headers were committed.
  * 4. Respects socket backpressure via drain events and cancellation via AbortSignal.
- * 5. Returns SseStreamResult to caller to enable precise telemetry recording upon stream closure.
+ * 5. Safely cleans up upstream async iterators via iterator.return() on premature client aborts.
+ * 6. Returns SseStreamResult to caller to enable precise telemetry recording upon stream closure.
  */
 export async function writeSseStream(
   reply: FastifyReply,
@@ -44,12 +48,20 @@ export async function writeSseStream(
   signal: AbortSignal,
 ): Promise<SseStreamResult> {
   const iterator = stream[Symbol.asyncIterator]();
+  let completedNormally = false;
 
   // 1. Fetch first chunk before committing HTTP 200 headers.
   // If this throws, headers are not sent, and the caller can return the real HTTP error status.
   const firstResult = await iterator.next();
 
   if (signal.aborted || reply.raw.writableEnded) {
+    if (typeof iterator.return === 'function') {
+      try {
+        await iterator.return();
+      } catch {
+        // Ignore premature abort errors
+      }
+    }
     return { aborted: true };
   }
 
@@ -65,7 +77,9 @@ export async function writeSseStream(
   let streamError: { readonly message: string; readonly code: string } | undefined;
 
   try {
-    if (!firstResult.done) {
+    if (firstResult.done) {
+      completedNormally = true;
+    } else {
       if (firstResult.value.usage) {
         finalUsage = firstResult.value.usage;
       }
@@ -93,6 +107,10 @@ export async function writeSseStream(
 
         result = await iterator.next();
       }
+
+      if (result.done) {
+        completedNormally = true;
+      }
     }
 
     if (!signal.aborted && !reply.raw.writableEnded) {
@@ -117,6 +135,15 @@ export async function writeSseStream(
       reply.raw.write(`data: ${JSON.stringify(payload)}\n\n`);
     }
   } finally {
+    // Clean up upstream async generator if terminated prematurely
+    if (!completedNormally && typeof iterator.return === 'function') {
+      try {
+        await iterator.return();
+      } catch {
+        // Ignore cancellation errors
+      }
+    }
+
     if (!reply.raw.writableEnded) {
       reply.raw.end();
     }

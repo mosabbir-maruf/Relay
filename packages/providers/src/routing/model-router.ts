@@ -28,6 +28,8 @@ export interface ResolvedRoutingPlan {
 export class ModelRouter implements RoutingPolicy {
   private readonly registry: ProviderRegistry;
   private readonly policies = new Map<string, ModelRoutingRule>();
+  private readonly planCache = new Map<string, ResolvedRoutingPlan>();
+  private lastObservedRegistryVersion = -1;
 
   constructor(options: ModelRouterOptions) {
     this.registry = options.registry;
@@ -52,6 +54,13 @@ export class ModelRouter implements RoutingPolicy {
   }
 
   /**
+   * Clears the resolved routing plan cache.
+   */
+  clearCache(): void {
+    this.planCache.clear();
+  }
+
+  /**
    * Resolves a model identifier into concrete provider-model bindings
    * for primary execution and ordered fallbacks.
    */
@@ -59,6 +68,18 @@ export class ModelRouter implements RoutingPolicy {
     const trimmedModel = requestedModel.trim();
     if (!trimmedModel) {
       throw new RelayInvalidRequestError('Missing required model identifier in routing request.');
+    }
+
+    // Invalidate plan cache if provider registry has been mutated
+    const currentVersion = this.registry.getVersion();
+    if (currentVersion !== this.lastObservedRegistryVersion) {
+      this.planCache.clear();
+      this.lastObservedRegistryVersion = currentVersion;
+    } else {
+      const cached = this.planCache.get(trimmedModel);
+      if (cached) {
+        return cached;
+      }
     }
 
     // 1. Resolve alias chain with cycle detection
@@ -123,12 +144,15 @@ export class ModelRouter implements RoutingPolicy {
       ...(fallbackTargets.length > 0 ? { fallbacks: fallbackTargets } : {}),
     };
 
-    return {
+    const plan: ResolvedRoutingPlan = {
       requestedModel: trimmedModel,
       primary: primaryBinding,
       fallbacks: fallbackBindings,
       decision,
     };
+
+    this.planCache.set(trimmedModel, plan);
+    return plan;
   }
 
   /**

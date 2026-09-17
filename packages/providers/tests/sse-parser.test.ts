@@ -72,4 +72,63 @@ describe('parseServerSentEvents', () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.data).toBe('line 1\nline 2');
   });
+
+  it('handles lone CR line breaks', async () => {
+    const stream = createMockReadableStream(['data: {"type":"cr"}\r\r']);
+
+    const events = [];
+    for await (const event of parseServerSentEvents(stream)) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.data).toBe('{"type":"cr"}');
+  });
+
+  it('handles multibyte UTF-8 characters split across byte chunks', async () => {
+    const encoder = new TextEncoder();
+    const rocketBytes = encoder.encode('🚀'); // 4 bytes
+    const part1 = encoder.encode('data: {"icon":"');
+    const part2 = rocketBytes.subarray(0, 2); // first 2 bytes of 🚀
+    const part3 = rocketBytes.subarray(2); // remaining 2 bytes of 🚀
+    const part4 = encoder.encode('"}\n\n');
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(part1);
+        controller.enqueue(part2);
+        controller.enqueue(part3);
+        controller.enqueue(part4);
+        controller.close();
+      },
+    });
+
+    const events = [];
+    for await (const event of parseServerSentEvents(stream)) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.data).toBe('{"icon":"🚀"}');
+  });
+
+  it('safely cancels reader on premature consumer exit without leaking locks', async () => {
+    let cancelCalled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: 1\n\ndata: 2\n\ndata: 3\n\n'));
+      },
+      cancel() {
+        cancelCalled = true;
+      },
+    });
+
+    for await (const event of parseServerSentEvents(stream)) {
+      if (event.data === '1') {
+        break; // Break early
+      }
+    }
+
+    expect(cancelCalled).toBe(true);
+  });
 });

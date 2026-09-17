@@ -78,6 +78,10 @@ async function main(): Promise<void> {
       },
       'Relay gateway is running and ready to accept requests.',
     );
+    const displayHost = config.env.HOST === '0.0.0.0' ? 'localhost' : config.env.HOST;
+    app.log.info(
+      `Relay AI Playground available at http://${displayHost}:${config.env.PORT}/playground`,
+    );
   } catch (err) {
     app.log.fatal(err, 'Failed to start Relay gateway');
     process.exit(1);

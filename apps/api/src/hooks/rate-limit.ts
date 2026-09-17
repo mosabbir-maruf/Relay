@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { RelayRateLimitError, type RateLimiter } from '@relay/core';
+import { getNormalizedPath } from '../utils/path.js';
+import { extractBearerToken } from './auth.js';
 
 export type RateLimitKeyStrategy = 'client_or_ip' | 'client_only' | 'ip_only';
 
@@ -24,14 +26,11 @@ export function resolveRateLimitKey(
     return `ip:${ip}`;
   }
 
-  const authHeader = request.headers.authorization;
-  if (authHeader) {
-    const match = /^Bearer\s+(\S+)$/i.exec(authHeader.trim());
-    if (match && match[1]) {
-      // Cryptographically hash the token to prevent credential exposure in limiter state
-      const tokenHash = createHash('sha256').update(match[1]).digest('hex').slice(0, 16);
-      return `client:${tokenHash}`;
-    }
+  const token = extractBearerToken(request.headers.authorization);
+  if (token) {
+    // Cryptographically hash the token to prevent credential exposure in limiter state
+    const tokenHash = createHash('sha256').update(token).digest('hex').slice(0, 16);
+    return `client:${tokenHash}`;
   }
 
   return `ip:${ip}`;
@@ -49,8 +48,7 @@ export function createRateLimitHook(options: RateLimitHookOptions) {
       return;
     }
 
-    const rawPath = request.url.split('?')[0] ?? '';
-    const normalizedPath = rawPath.replace(/\/+$/, '') || '/';
+    const normalizedPath = getNormalizedPath(request.url);
 
     // Exempt operational health check endpoints from rate limiting
     if (normalizedPath === '/health') {
