@@ -100,8 +100,19 @@ start_tunnel() {
     echo "========================================================"
     echo "PUBLIC_URL=${tunnel_url}"
     echo "BASE_URL=${tunnel_url}/v1"
-    if [ -n "${SERVED_MODEL_NAME:-}" ]; then
-      echo "MODEL=${SERVED_MODEL_NAME}"
+    local model_alias="${SERVED_MODEL_NAME:-}"
+    if [ -z "${model_alias}" ] && [ -f "${WORK_DIR}/served_model_name.txt" ]; then
+      model_alias=$(cat "${WORK_DIR}/served_model_name.txt" 2>/dev/null || true)
+    fi
+    if [ -z "${model_alias}" ] && [ -f "${WORK_DIR}/resolved_config.json" ]; then
+      model_alias=$(python3 -c "import json; print(json.load(open('${WORK_DIR}/resolved_config.json')).get('served_model_name', ''))" 2>/dev/null || true)
+    fi
+    if [ -z "${model_alias}" ] && [ -n "${MODEL_ID:-}" ]; then
+      model_alias=$(python3 -c "import sys, os; sys.path.insert(0, '${SCRIPT_DIR}'); import preflight; print(preflight.sanitize_served_name('${MODEL_ID}'))" 2>/dev/null || true)
+    fi
+
+    if [ -n "${model_alias}" ]; then
+      echo "MODEL=${model_alias}"
     elif [ -n "${QWEN_MODEL:-}" ]; then
       echo "QWEN_BASE_URL=${tunnel_url}/v1"
       echo "QWEN_MODEL=${QWEN_MODEL}"

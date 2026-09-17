@@ -200,6 +200,8 @@ for a in data.get('command_args', []):
   fi
 
   mkdir -p "${WORK_DIR}"
+  echo "${preflight_json}" > "${WORK_DIR}/resolved_config.json"
+  echo "${served_name}" > "${WORK_DIR}/served_model_name.txt"
   echo "Launching vLLM in background..."
   echo "Model ID:    ${MODEL_ID}"
   echo "Served Name: ${served_name}"
@@ -263,6 +265,14 @@ status_server() {
 test_inference() {
   echo "Resolving served model name for inference test..."
   local target_model="${SERVED_MODEL_NAME:-}"
+
+  if [ -z "${target_model}" ] && [ -f "${WORK_DIR}/served_model_name.txt" ]; then
+    target_model=$(cat "${WORK_DIR}/served_model_name.txt" 2>/dev/null || true)
+  fi
+
+  if [ -z "${target_model}" ] && [ -f "${WORK_DIR}/resolved_config.json" ]; then
+    target_model=$(python3 -c "import json; print(json.load(open('${WORK_DIR}/resolved_config.json')).get('served_model_name', ''))" 2>/dev/null || true)
+  fi
 
   if [ -z "${target_model}" ]; then
     # Probe local endpoint for registered model

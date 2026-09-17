@@ -261,6 +261,67 @@ def sanitize_served_name(model_id: str) -> str:
     return name.strip("-")
 
 
+def resolve_effective_served_model_name(
+    user_override: Optional[str] = None,
+    model_id: Optional[str] = None,
+    resolved_config: Optional[Dict[str, Any]] = None,
+    config_path: Optional[str] = None,
+    work_dir: Optional[str] = None,
+) -> str:
+    """
+    Resolves the authoritative served model name (OpenAI API alias):
+    1. If user explicitly provided an override (non-None, non-empty), use it.
+    2. If resolved_config dict is provided and contains 'served_model_name', use it.
+    3. If SERVED_MODEL_NAME environment variable is set and non-empty, use it.
+    4. If config_path, WORK_DIR/served_model_name.txt, or WORK_DIR/resolved_config.json exists, read from it.
+    5. If model_id or MODEL_ID environment variable is available, sanitize it.
+    6. Fallback to 'model'.
+    """
+    if user_override is not None and str(user_override).strip():
+        return str(user_override).strip()
+
+    if resolved_config and isinstance(resolved_config, dict):
+        cfg_name = resolved_config.get("served_model_name")
+        if cfg_name and str(cfg_name).strip():
+            return str(cfg_name).strip()
+
+    env_name = os.environ.get("SERVED_MODEL_NAME")
+    if env_name and env_name.strip():
+        return env_name.strip()
+
+    effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
+    candidate_paths = []
+    if config_path:
+        candidate_paths.append(config_path)
+    candidate_paths.extend(
+        [
+            os.path.join(effective_work_dir, "served_model_name.txt"),
+            os.path.join(effective_work_dir, "resolved_config.json"),
+        ]
+    )
+
+    for p in candidate_paths:
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if p.endswith(".json"):
+                    data = json.loads(content)
+                    n = data.get("served_model_name")
+                    if n and str(n).strip():
+                        return str(n).strip()
+                elif content:
+                    return content
+            except Exception:
+                pass
+
+    mid = model_id or os.environ.get("MODEL_ID")
+    if mid and str(mid).strip():
+        return sanitize_served_name(str(mid).strip())
+
+    return "model"
+
+
 def detect_gpus() -> Dict[str, Any]:
     """
     Detects available NVIDIA GPUs via nvidia-smi.
@@ -1608,6 +1669,27 @@ def main() -> None:
     resolved = resolve_configuration(
         model_id, attrs, user_overrides, gpu_info=gpu_info
     )
+
+    # Persist resolved configuration and alias if output directory is accessible
+    work_dir = os.environ.get("WORK_DIR", "/kaggle/working")
+    try:
+        if not os.path.exists(work_dir):
+            os.makedirs(work_dir, exist_ok=True)
+        if os.path.isdir(work_dir) and os.access(work_dir, os.W_OK):
+            with open(
+                os.path.join(work_dir, "resolved_config.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(resolved, f, indent=2)
+            with open(
+                os.path.join(work_dir, "served_model_name.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(str(resolved.get("served_model_name", "")) + "\n")
+    except Exception:
+        pass
 
     if args.json:
         # Output ONLY JSON to stdout

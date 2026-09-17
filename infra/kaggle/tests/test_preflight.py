@@ -857,6 +857,78 @@ for a in data.get('command_args', []):
         self.assertTrue(data_uri.startswith("data:image/png;base64,"))
         self.assertTrue(len(data_uri) > 150)
 
+    def test_served_model_name_validation_regression(self):
+        """
+        Regression test:
+        1. SERVED_MODEL_NAME=None -> resolved alias 'gpt2' -> /v1/models validation passes.
+        2. Explicit SERVED_MODEL_NAME='my-gpt2' -> validation uses 'my-gpt2'.
+        """
+        model_id = "openai-community/gpt2"
+        attrs = {
+            "architectures": ["GPT2LMHeadModel"],
+            "model_type": "gpt2",
+            "context_length": 1024,
+            "param_count": 137_022_720,
+        }
+
+        # Case 1: SERVED_MODEL_NAME = None (Default)
+        raw_user_override = None
+        resolved = preflight.resolve_configuration(
+            model_id, attrs, {"served_model_name": raw_user_override}, gpu_info=self.mock_t4_gpu
+        )
+        # Verify preflight resolved the alias automatically to 'gpt2'
+        self.assertEqual(resolved["served_model_name"], "gpt2")
+
+        # Resolve authoritative model alias using the helper
+        effective_alias = preflight.resolve_effective_served_model_name(
+            user_override=raw_user_override,
+            model_id=model_id,
+            resolved_config=resolved,
+        )
+        self.assertEqual(effective_alias, "gpt2")
+
+        # Simulate /v1/models response from running vLLM server
+        running_models = ["gpt2"]
+
+        # If notebook checked the raw user override (None), it would fail:
+        self.assertNotIn(raw_user_override, running_models)
+        # Using the authoritative effective_alias, validation passes:
+        self.assertIn(effective_alias, running_models)
+
+        # Also test on-disk config resolution when config file is provided or read
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = os.path.join(tmpdir, "resolved_config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({"served_model_name": "gpt2"}, f)
+            disk_alias = preflight.resolve_effective_served_model_name(
+                user_override=None,
+                config_path=cfg_path,
+            )
+            self.assertEqual(disk_alias, "gpt2")
+            self.assertIn(disk_alias, running_models)
+
+        # Case 2: Explicit SERVED_MODEL_NAME = "my-gpt2"
+        explicit_user_override = "my-gpt2"
+        resolved_explicit = preflight.resolve_configuration(
+            model_id, attrs, {"served_model_name": explicit_user_override}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved_explicit["served_model_name"], "my-gpt2")
+
+        effective_explicit = preflight.resolve_effective_served_model_name(
+            user_override=explicit_user_override,
+            model_id=model_id,
+            resolved_config=resolved_explicit,
+        )
+        self.assertEqual(effective_explicit, "my-gpt2")
+
+        # When server was launched with explicit name, /v1/models returns ['my-gpt2']
+        running_models_explicit = ["my-gpt2"]
+        self.assertIn(effective_explicit, running_models_explicit)
+
+        # Crucially: if server was running default 'gpt2', validation of explicit override fails
+        self.assertNotIn(effective_explicit, ["gpt2"])
+
 
 if __name__ == "__main__":
     unittest.main()
