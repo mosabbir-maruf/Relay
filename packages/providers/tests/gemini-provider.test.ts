@@ -82,6 +82,67 @@ describe('GeminiProvider', () => {
     expect(sentBody.generationConfig.temperature).toBe(0.7);
   });
 
+  it('accepts normalized ImageContentPart content and formats into Gemini payload', async () => {
+    const mockResponse = {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ text: 'This is a test image analysis.' }],
+          },
+          finishReason: 'STOP',
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 260,
+        candidatesTokenCount: 15,
+        totalTokenCount: 275,
+      },
+    };
+
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new GeminiProvider({
+      apiKey: 'gemini-test-key',
+    });
+
+    const dataUri =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    const result = await provider.chat({
+      model: 'gemini-2.5-flash',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              imageUrl: { url: dataUri },
+            },
+            {
+              type: 'text',
+              text: 'Describe this image',
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result.message.content).toBe('This is a test image analysis.');
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    const sentBody = JSON.parse(fetchCall[1].body);
+
+    expect(sentBody.contents[0].parts).toEqual([
+      { image_url: { url: dataUri } },
+      { text: 'Describe this image' },
+    ]);
+  });
+
   it('normalizes Gemini 400 error to RelayInvalidRequestError', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response(

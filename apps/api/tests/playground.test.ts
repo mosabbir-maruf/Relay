@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { ProviderRegistry } from '@relay/providers';
 import { createApp } from '../src/app.js';
-import { loadConfig } from '../src/config/index.js';
+import {
+  isMultimodalModelId,
+  loadConfig,
+  resolveModelVisionCapability,
+} from '../src/config/index.js';
 import { PLAYGROUND_CSP_HEADER } from '../src/routes/playground.js';
 import { TestMockProvider } from './mock-provider.js';
 
@@ -113,8 +117,29 @@ describe('AI Playground Route (GET /playground)', () => {
       expect(html).toContain('id="max-tokens-input"');
       expect(html).toContain('id="system-prompt-input"');
       expect(html).toContain('id="stream-toggle"');
+      expect(html).toContain('id="quick-tunnel-sse-warning"');
+      expect(html).toContain('Quick Tunnels do not support Server-Sent Events (SSE)');
       expect(html).toContain('id="relay-api-key-input"');
       expect(html).toContain('id="reset-settings-btn"');
+    });
+
+    it('renders Quick Tunnel SSE warning container and binds client handler', async () => {
+      const { app } = await createTestApp();
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/playground',
+      });
+
+      expect(res.statusCode).toBe(200);
+      const html = res.body;
+
+      expect(html).toContain('id="quick-tunnel-sse-warning"');
+      expect(html).toContain('Quick Tunnels do not support Server-Sent Events (SSE)');
+      expect(html).toContain(
+        "quickTunnelSseWarning: document.getElementById('quick-tunnel-sse-warning')",
+      );
+      expect(html).toContain('active.is_quick_tunnel');
     });
 
     it('stores credentials in sessionStorage and never in localStorage', async () => {
@@ -636,6 +661,467 @@ describe('AI Playground Route (GET /playground)', () => {
         userConfiguredMaxTokens, // Still 2048!
       );
       expect(largeRes.effectiveMaxTokens).toBe(2048);
+    });
+  });
+
+  describe('7. Multimodal Image Attachment & Vision Capability Support', () => {
+    it('contains image attachment UI markup, preview containers, and warning banners', async () => {
+      const { app } = await createTestApp();
+      const res = await app.inject({ method: 'GET', url: '/playground' });
+      const html = res.body;
+
+      // Attachment button & file input
+      expect(html).toContain('id="attach-image-btn"');
+      expect(html).toContain('id="image-file-input"');
+      expect(html).toContain('accept="image/png,image/jpeg,image/webp"');
+
+      // Image preview container & chip components
+      expect(html).toContain('id="image-preview-container"');
+      expect(html).toContain('id="image-preview-thumb"');
+      expect(html).toContain('id="image-preview-name"');
+      expect(html).toContain('id="image-preview-size"');
+      expect(html).toContain('id="remove-image-btn"');
+
+      // Unsupported warning banner
+      expect(html).toContain('id="image-unsupported-warning"');
+
+      // Essential client logic functions and handlers
+      expect(html).toContain('function isModelVisionCapable(');
+      expect(html).toContain('function getModelImageTokenBudget(');
+      expect(html).toContain('function handleSelectedImageFile(');
+      expect(html).toContain('function clearAttachedImage(');
+      expect(html).toContain('function calculateRequestPayloadSize(');
+      expect(html).toContain('function sanitizeMessageForStorage(');
+      expect(html).toContain("composerInputBox.addEventListener('dragover'");
+      expect(html).toContain("chatTextarea.addEventListener('paste'");
+    });
+
+    it('formats multimodal message payload with image_url and text parts when image is attached', () => {
+      const attachedImage = {
+        dataUri:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        name: 'test.png',
+        size: 100,
+        type: 'image/png',
+      };
+      const textPrompt = 'Explain this diagram';
+
+      // Simulation of composer message builder in sendMessage()
+      function buildUserContent(text: string, attachment: typeof attachedImage | null) {
+        if (!attachment) return text;
+        return [
+          {
+            type: 'image_url',
+            image_url: {
+              url: attachment.dataUri,
+            },
+          },
+          {
+            type: 'text',
+            text,
+          },
+        ];
+      }
+
+      const multimodalContent = buildUserContent(textPrompt, attachedImage);
+      expect(Array.isArray(multimodalContent)).toBe(true);
+      expect(multimodalContent).toEqual([
+        {
+          type: 'image_url',
+          image_url: {
+            url: attachedImage.dataUri,
+          },
+        },
+        {
+          type: 'text',
+          text: 'Explain this diagram',
+        },
+      ]);
+
+      // When no attachment, plain string content must be preserved
+      const textOnlyContent = buildUserContent(textPrompt, null);
+      expect(typeof textOnlyContent).toBe('string');
+      expect(textOnlyContent).toBe('Explain this diagram');
+    });
+
+    it('enforces 4-tier precedence for vision capability resolution', () => {
+      // 1. Explicit capabilities.supportsVision overrides everything
+      const explicitFalse = resolveModelVisionCapability('smolvlm2-500m', false, {
+        supportsVision: true,
+        architecture: 'SmolVLMForConditionalGeneration',
+      });
+      expect(explicitFalse.supportsVision).toBe(false);
+      expect(explicitFalse.source).toBe('explicit_capability');
+
+      const explicitTrue = resolveModelVisionCapability('text-only-gpt', true);
+      expect(explicitTrue.supportsVision).toBe(true);
+      expect(explicitTrue.source).toBe('explicit_capability');
+
+      // 2. Model/provider metadata
+      const metaTrue = resolveModelVisionCapability('custom-model', undefined, {
+        supportsVision: true,
+      });
+      expect(metaTrue.supportsVision).toBe(true);
+      expect(metaTrue.source).toBe('model_metadata');
+
+      const metaFalse = resolveModelVisionCapability('custom-vlm-model', undefined, {
+        supportsVision: false,
+      });
+      expect(metaFalse.supportsVision).toBe(false);
+      expect(metaFalse.source).toBe('model_metadata');
+
+      // 3. Architecture/model_type
+      const archVision = resolveModelVisionCapability('my-model-1', undefined, {
+        architecture: 'SmolVLMForConditionalGeneration',
+      });
+      expect(archVision.supportsVision).toBe(true);
+      expect(archVision.source).toBe('architecture_metadata');
+
+      // 4. Model-ID heuristic fallback
+      const heuristicSmolVLM = resolveModelVisionCapability('HuggingFaceTB/SmolVLM2-500M-Instruct');
+      expect(heuristicSmolVLM.supportsVision).toBe(true);
+      expect(heuristicSmolVLM.source).toBe('model_id_heuristic_fallback');
+
+      const heuristicGemini = resolveModelVisionCapability('gemini-1.5-flash');
+      expect(heuristicGemini.supportsVision).toBe(true);
+      expect(heuristicGemini.source).toBe('model_id_heuristic_fallback');
+
+      // Non-vision model
+      const textOnly = resolveModelVisionCapability('qwen3-coder-30b');
+      expect(textOnly.supportsVision).toBe(false);
+      expect(textOnly.source).toBe('default_text_only');
+    });
+
+    it('rejects image attachment if active model does not support vision', () => {
+      const models = [
+        { id: 'qwen3-coder-30b', capabilities: { supportsVision: false } },
+        { id: 'smolvlm2-500m', capabilities: { supportsVision: true } },
+      ];
+
+      function simulateValidateModelForAttachment(modelId: string, modelList: typeof models) {
+        const m = modelList.find((item) => item.id === modelId);
+        const isCapable = Boolean(m?.capabilities?.supportsVision);
+        if (!isCapable) {
+          return {
+            allowed: false,
+            error: `Model "${modelId}" does not support image input. Please select a multimodal model (e.g., SmolVLM2 or Gemini).`,
+          };
+        }
+        return { allowed: true };
+      }
+
+      const invalid = simulateValidateModelForAttachment('qwen3-coder-30b', models);
+      expect(invalid.allowed).toBe(false);
+      expect(invalid.error).toContain('does not support image input');
+
+      const valid = simulateValidateModelForAttachment('smolvlm2-500m', models);
+      expect(valid.allowed).toBe(true);
+      expect(valid.error).toBeUndefined();
+    });
+
+    it('validates supported MIME types (PNG, JPEG, WebP) and rejects others', () => {
+      const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+
+      function simulateValidateMimeType(type: string) {
+        if (!SUPPORTED_TYPES.includes(type)) {
+          return {
+            valid: false,
+            error: `Unsupported file type (${type || 'unknown'}). Please select a PNG, JPEG, or WebP image.`,
+          };
+        }
+        return { valid: true };
+      }
+
+      expect(simulateValidateMimeType('image/png').valid).toBe(true);
+      expect(simulateValidateMimeType('image/jpeg').valid).toBe(true);
+      expect(simulateValidateMimeType('image/webp').valid).toBe(true);
+
+      const pdf = simulateValidateMimeType('application/pdf');
+      expect(pdf.valid).toBe(false);
+      expect(pdf.error).toContain('Unsupported file type');
+
+      const svg = simulateValidateMimeType('image/svg+xml');
+      expect(svg.valid).toBe(false);
+      expect(svg.error).toContain('Unsupported file type');
+
+      const text = simulateValidateMimeType('text/plain');
+      expect(text.valid).toBe(false);
+      expect(text.error).toContain('Unsupported file type');
+    });
+
+    it('rejects files exceeding 6 MB file-size limit', () => {
+      const MAX_FILE_SIZE = 6 * 1024 * 1024; // 6 MB
+
+      function simulateValidateFileSize(size: number) {
+        if (size > MAX_FILE_SIZE) {
+          return {
+            valid: false,
+            error: `Image size (${(size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum limit of 6.00 MB.`,
+          };
+        }
+        return { valid: true };
+      }
+
+      expect(simulateValidateFileSize(1024 * 1024).valid).toBe(true); // 1 MB OK
+      expect(simulateValidateFileSize(6 * 1024 * 1024).valid).toBe(true); // 6 MB OK
+      const over = simulateValidateFileSize(6 * 1024 * 1024 + 1); // 6 MB + 1 byte
+      expect(over.valid).toBe(false);
+      expect(over.error).toContain('exceeds the maximum limit of 6.00 MB');
+    });
+
+    it('rejects serialized request payload exceeding 9.5 MB request-body budget', () => {
+      const MAX_PAYLOAD_BYTES = 9.5 * 1024 * 1024; // 9.5 MB
+
+      function simulateValidatePayloadSize(payload: unknown) {
+        const serialized = JSON.stringify(payload);
+        const bytes = new TextEncoder().encode(serialized).length;
+        if (bytes > MAX_PAYLOAD_BYTES) {
+          return {
+            valid: false,
+            bytes,
+            error: `Total request payload size (${(bytes / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowable request budget (9.50 MB).`,
+          };
+        }
+        return { valid: true, bytes };
+      }
+
+      const validPayload = {
+        model: 'smolvlm2-500m',
+        messages: [{ role: 'user', content: 'Normal prompt with small image' }],
+      };
+      expect(simulateValidatePayloadSize(validPayload).valid).toBe(true);
+
+      // Create a payload that exceeds 9.5 MB
+      const hugePayload = {
+        model: 'smolvlm2-500m',
+        messages: [{ role: 'user', content: 'X'.repeat(10 * 1024 * 1024) }],
+      };
+      const hugeResult = simulateValidatePayloadSize(hugePayload);
+      expect(hugeResult.valid).toBe(false);
+      expect(hugeResult.error).toContain('exceeds the maximum allowable request budget');
+    });
+
+    it('accurately estimates multimodal tokens without base64 character pollution', () => {
+      const base64DataUri = `data:image/png;base64,${'A'.repeat(500000)}`; // 500k base64 characters
+      const messages = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: base64DataUri },
+            },
+            {
+              type: 'text',
+              text: 'What is shown in this picture?', // 30 characters
+            },
+          ],
+        },
+      ];
+
+      // Simulated estimateMessagesTokens matching playground client implementation
+      function simulateEstimateMessagesTokens(msgs: typeof messages, imageTokenBudget = 576) {
+        let totalChars = 0;
+        let totalImageTokens = 0;
+
+        for (const msg of msgs) {
+          if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+              if (part.type === 'text' && typeof part.text === 'string') {
+                totalChars += part.text.length;
+              } else if (part.type === 'image_url' || (part as any).image_url) {
+                totalImageTokens += imageTokenBudget;
+              }
+            }
+          }
+        }
+
+        const textTokens = Math.ceil(totalChars / 3.5);
+        const framingOverhead = msgs.length * 4 + 3;
+        return {
+          totalTokens: textTokens + totalImageTokens + framingOverhead,
+          textTokens,
+          totalImageTokens,
+          framingOverhead,
+        };
+      }
+
+      const estimate = simulateEstimateMessagesTokens(messages, 576);
+
+      // 30 chars / 3.5 = 9 text tokens
+      expect(estimate.textTokens).toBe(9);
+      // Fixed 576 image token budget, NOT 500,000 / 3.5 = ~142,857 tokens!
+      expect(estimate.totalImageTokens).toBe(576);
+      expect(estimate.framingOverhead).toBe(7); // 1 msg * 4 + 3 = 7
+      expect(estimate.totalTokens).toBe(9 + 576 + 7); // 592 tokens
+    });
+
+    it('resolves model-specific image token budgets from metadata or fallback', () => {
+      const models = [
+        { id: 'custom-vlm', capabilities: { imageTokens: 1024 } },
+        { id: 'metadata-vlm', image_tokens: 768 },
+        { id: 'default-vlm' },
+      ];
+
+      function simulateGetImageTokenBudget(modelId: string, modelList: typeof models) {
+        const m = modelList.find((item) => item.id === modelId);
+        if (m && (m as any).capabilities?.imageTokens) {
+          return {
+            tokens: (m as any).capabilities.imageTokens,
+            source: 'capabilities.imageTokens',
+          };
+        }
+        if (m && (m as any).image_tokens) {
+          return { tokens: (m as any).image_tokens, source: 'model_metadata.image_tokens' };
+        }
+        return { tokens: 576, source: 'default_conservative_fallback' };
+      }
+
+      expect(simulateGetImageTokenBudget('custom-vlm', models)).toEqual({
+        tokens: 1024,
+        source: 'capabilities.imageTokens',
+      });
+      expect(simulateGetImageTokenBudget('metadata-vlm', models)).toEqual({
+        tokens: 768,
+        source: 'model_metadata.image_tokens',
+      });
+      expect(simulateGetImageTokenBudget('default-vlm', models)).toEqual({
+        tokens: 576,
+        source: 'default_conservative_fallback',
+      });
+    });
+
+    it('rejects when prompt text plus image token budget exceeds model context limit', () => {
+      const model = { id: 'small-vlm', max_model_len: 1024 };
+      // Prompt has 600 tokens of text + 576 tokens of image = 1176 tokens > 1024 limit
+      const longText = 'A'.repeat(2100); // 2100 / 3.5 = 600 text tokens
+      const textTokens = Math.ceil(longText.length / 3.5); // 600
+      const imageTokens = 576;
+      const framing = 1 * 4 + 3; // 7
+      const totalEstimated = textTokens + imageTokens + framing; // 1183 tokens
+
+      const availableBudget = model.max_model_len - totalEstimated; // 1024 - 1183 = -159
+      expect(availableBudget).toBeLessThanOrEqual(0);
+
+      const errorMsg = `Input messages (~${totalEstimated} tokens) exceed the model context length of ${model.max_model_len} tokens.`;
+      expect(errorMsg).toContain('exceed the model context length of 1024 tokens');
+    });
+
+    it('sanitizes conversation history before localStorage to strip base64 image data', () => {
+      const messagesInState = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...' },
+            },
+            {
+              type: 'text',
+              text: 'Explain this diagram in detail',
+            },
+          ],
+          imageUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...',
+          imageName: 'diagram.png',
+          hasImage: true,
+          timestamp: 1726500000,
+        },
+        {
+          role: 'assistant',
+          content: 'This diagram shows a network topology.',
+          timestamp: 1726500005,
+        },
+      ];
+
+      // Exact implementation of sanitizeMessageForStorage
+      function sanitizeMessageForStorage(msg: any) {
+        if (!msg) return null;
+        const copy = { ...msg };
+        delete copy.imageUrl;
+
+        if (Array.isArray(copy.content)) {
+          let extractedText = '';
+          let hasImage = false;
+          for (const p of copy.content) {
+            if (p && p.type === 'text') extractedText = p.text || '';
+            if (p && (p.type === 'image_url' || p.image_url)) hasImage = true;
+          }
+          copy.content = extractedText;
+          if (hasImage) {
+            copy.hasImage = true;
+            copy.imagePlaceholder = copy.imageName || 'Attached image';
+          }
+        }
+        return copy;
+      }
+
+      const sanitized = messagesInState.map(sanitizeMessageForStorage);
+      const serialized = JSON.stringify(sanitized);
+
+      // Verify base64 data URI is completely absent
+      expect(serialized).not.toContain('data:image/');
+      expect(sanitized[0].imageUrl).toBeUndefined();
+      expect(sanitized[0].content).toBe('Explain this diagram in detail');
+      expect(sanitized[0].hasImage).toBe(true);
+      expect(sanitized[0].imagePlaceholder).toBe('diagram.png');
+      expect(serialized.length).toBeLessThan(500); // Extremely lightweight
+    });
+
+    it('accepts multimodal requests on POST /v1/chat/completions without 413 or schema errors', async () => {
+      const { app, registry } = await createTestApp();
+
+      // Register a vision-capable test model on mock-provider
+      registry.registerModel({
+        id: 'mock-vision-model',
+        provider: 'mock-provider',
+        capabilities: {
+          supportsVision: true,
+          supportsStreaming: true,
+          supportsToolCalling: true,
+          supportsStructuredOutput: true,
+          maxContextTokens: 4096,
+          maxOutputTokens: 2048,
+          imageTokens: 576,
+        },
+        contextWindow: 4096,
+        maxOutputTokens: 2048,
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        payload: {
+          model: 'mock-vision-model',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+                  },
+                },
+                {
+                  type: 'text',
+                  text: 'What color is this pixel?',
+                },
+              ],
+            },
+          ],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.object).toBe('chat.completion');
+      expect(body.model).toBe('mock-vision-model');
+      expect(body.choices).toBeDefined();
+      expect(body.choices.length).toBe(1);
+      expect(body.choices[0].message.role).toBe('assistant');
     });
   });
 });

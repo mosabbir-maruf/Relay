@@ -18,6 +18,22 @@ function getUpstreamMaxModelLen(provider: unknown, modelId: string): number | un
   return undefined;
 }
 
+function isProviderQuickTunnel(provider: unknown): boolean {
+  if (!provider || typeof provider !== 'object') return false;
+  if (
+    'isQuickTunnel' in provider &&
+    typeof (provider as Record<string, unknown>).isQuickTunnel === 'boolean'
+  ) {
+    return (provider as Record<string, unknown>).isQuickTunnel as boolean;
+  }
+  if ('baseUrl' in provider && typeof (provider as Record<string, unknown>).baseUrl === 'string') {
+    return ((provider as Record<string, unknown>).baseUrl as string)
+      .toLowerCase()
+      .includes('.trycloudflare.com');
+  }
+  return false;
+}
+
 export interface ModelsRoutesOptions {
   readonly registry: ProviderRegistry;
   readonly router?: ModelRouter | undefined;
@@ -32,6 +48,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
         const provider = options.registry.getProvider(model.provider);
         const caps = provider?.getCapabilities?.(model.id) ?? model.capabilities;
         const maxModelLen = getUpstreamMaxModelLen(provider, model.id) ?? model.max_model_len;
+        const isQuickTunnel = isProviderQuickTunnel(provider);
 
         return {
           id: model.id,
@@ -40,6 +57,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
           owned_by: model.provider,
           capabilities: caps,
           ...(maxModelLen !== undefined ? { max_model_len: maxModelLen } : {}),
+          ...(isQuickTunnel ? { is_quick_tunnel: true } : {}),
         };
       });
 
@@ -56,6 +74,8 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
                 getUpstreamMaxModelLen(provider, plan.primary.modelInfo.id) ??
                 plan.primary.modelInfo.max_model_len;
 
+              const isQuickTunnel = isProviderQuickTunnel(provider);
+
               data.push({
                 id: policy.model,
                 object: 'model',
@@ -63,6 +83,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
                 owned_by: plan.primary.provider.id,
                 capabilities: caps,
                 ...(maxModelLen !== undefined ? { max_model_len: maxModelLen } : {}),
+                ...(isQuickTunnel ? { is_quick_tunnel: true } : {}),
               });
             } catch {
               // Skip invalid alias configs
@@ -102,6 +123,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
           const maxModelLen =
             getUpstreamMaxModelLen(provider, plan.primary.modelInfo.id) ??
             plan.primary.modelInfo.max_model_len;
+          const isQuickTunnel = isProviderQuickTunnel(provider);
 
           return reply.status(200).send({
             id: model,
@@ -110,6 +132,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
             owned_by: plan.primary.provider.id,
             capabilities: caps,
             ...(maxModelLen !== undefined ? { max_model_len: maxModelLen } : {}),
+            ...(isQuickTunnel ? { is_quick_tunnel: true } : {}),
           });
         }
 
@@ -117,6 +140,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
         const caps = provider.getCapabilities?.(modelInfo.id) ?? modelInfo.capabilities;
         const maxModelLen =
           getUpstreamMaxModelLen(provider, modelInfo.id) ?? modelInfo.max_model_len;
+        const isQuickTunnel = isProviderQuickTunnel(provider);
 
         return reply.status(200).send({
           id: model,
@@ -125,6 +149,7 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
           owned_by: provider.id,
           capabilities: caps,
           ...(maxModelLen !== undefined ? { max_model_len: maxModelLen } : {}),
+          ...(isQuickTunnel ? { is_quick_tunnel: true } : {}),
         });
       } catch (err) {
         if (

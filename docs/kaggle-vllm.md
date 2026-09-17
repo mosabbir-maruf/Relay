@@ -301,15 +301,39 @@ When requests through the public tunnel fail, isolate the cause in this exact or
 4. **Tunnel Logs**: `./infra/kaggle/cloudflared.sh logs 30`
    - _If errors_: Rate-limiting or network disconnection at Cloudflare edge.
 5. **Public Model Discovery**: `curl https://<subdomain>.trycloudflare.com/v1/models`
-   - _If fails_: DNS edge propagation delay. Wait 15–30 seconds.
+   - _If HTTP 530_: The tunnel process or Kaggle notebook stopped, disconnecting the tunnel connector. Re-run Step 12 to generate an active URL.
+   - _If connection error_: DNS edge propagation delay. Wait 15–30 seconds.
 6. **Public Chat Completion**: `curl -X POST https://<subdomain>.trycloudflare.com/v1/chat/completions ...`
    - _If fails_: Payload validation error or client request timeout.
+
+---
+
+## Tunnel Modes: Quick Tunnel vs. Named Tunnel
+
+### A. Quick Tunnel (`trycloudflare.com`) — Development & Testing
+
+- **Zero Configuration**: Default mode; requires no Cloudflare account or credentials.
+- **Ephemeral**: Generates a random subdomain on each run. When `cloudflared` stops or Kaggle restarts, the URL becomes invalid and returns Cloudflare HTTP 530 (Error 1033).
+- **Streaming Limitation**: **Quick Tunnels do not support Server-Sent Events (SSE).** In the Relay Playground, toggle **Stream: Off** to use standard non-streaming completions.
+
+### B. Named Cloudflare Tunnel — Production & Streaming
+
+For persistent URLs and real-time SSE streaming:
+
+1. Create a Cloudflare Tunnel in your Cloudflare Zero Trust dashboard with a custom domain (e.g. `vllm.yourdomain.com`).
+2. Set Kaggle secrets or environment variables:
+   ```bash
+   export CLOUDFLARE_TUNNEL_TOKEN="<your-tunnel-token>"
+   export CLOUDFLARE_TUNNEL_HOSTNAME="vllm.yourdomain.com"
+   ```
+3. Run `./infra/kaggle/cloudflared.sh start`. The tunnel will bind to your persistent domain, and SSE streaming will work end-to-end (with `Content-Type: text/event-stream`).
 
 ---
 
 ## Known Limitations
 
 1. **Ephemeral Lifespan**: Kaggle compute sessions terminate automatically after 9–12 hours or 40–60 minutes of browser inactivity.
-2. **Dynamic URLs**: Cloudflare Quick Tunnels generate a new random URL on every startup. You must update your local Relay configuration when restarting a session.
-3. **Hardware Ceiling**: Models requiring more than 30 GB VRAM cannot fit on Kaggle's dual Tesla T4 GPUs.
-4. **No FP8 on T4**: FP8 quantized weights cannot execute on Turing hardware.
+2. **Dynamic URLs on Quick Tunnels**: Cloudflare Quick Tunnels generate a new random URL on every startup. You must update your local Relay configuration when restarting a session.
+3. **No SSE on Quick Tunnels**: Quick Tunnels do not support Server-Sent Events (SSE). Use non-streaming requests in the Playground, or configure a Named Tunnel.
+4. **Hardware Ceiling**: Models requiring more than 30 GB VRAM cannot fit on Kaggle's dual Tesla T4 GPUs.
+5. **No FP8 on T4**: FP8 quantized weights cannot execute on Turing hardware.

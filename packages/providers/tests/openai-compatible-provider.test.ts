@@ -80,6 +80,76 @@ describe('OpenAICompatibleProvider', () => {
     );
   });
 
+  it('serializes canonical ImageContentPart array to standard OpenAI wire format (image_url)', async () => {
+    const mockResponse = {
+      id: 'chatcmpl-test-vlm',
+      object: 'chat.completion',
+      created: 1726500000,
+      model: 'smolvlm',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: 'I see an image of a red cat.' },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: { prompt_tokens: 580, completion_tokens: 10, total_tokens: 590 },
+    };
+
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAICompatibleProvider({
+      id: 'vllm-smolvlm',
+      name: 'vLLM SmolVLM2',
+      baseUrl: 'http://localhost:8000/v1',
+    });
+
+    const dataUri =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    await provider.chat({
+      model: 'smolvlm',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              imageUrl: { url: dataUri, detail: 'auto' },
+            },
+            {
+              type: 'text',
+              text: 'What is this?',
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const callArgs = (globalThis.fetch as any).mock.calls[0];
+    const sentBody = JSON.parse(callArgs[1].body);
+
+    expect(sentBody.messages[0].content).toEqual([
+      {
+        type: 'image_url',
+        image_url: {
+          url: dataUri,
+          detail: 'auto',
+        },
+      },
+      {
+        type: 'text',
+        text: 'What is this?',
+      },
+    ]);
+  });
+
   it('normalizes HTTP 401 to RelayAuthenticationError', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ error: { message: 'Incorrect API key provided' } }), {

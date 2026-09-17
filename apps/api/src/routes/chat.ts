@@ -4,6 +4,7 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   CircuitBreaker,
+  ContentPart,
   NormalizedMessage,
   ResponseFormat,
   ToolCall,
@@ -412,15 +413,45 @@ export function createChatRoutes(options: ChatRoutesOptions): FastifyPluginAsync
 function parseChatCompletionRequest(body: Record<string, unknown>): ChatCompletionRequest {
   const rawMessages = body['messages'] as Array<Record<string, unknown>>;
   const messages: NormalizedMessage[] = rawMessages.map((m) => {
+    let content: string | readonly ContentPart[];
+    if (typeof m['content'] === 'string') {
+      content = m['content'];
+    } else if (Array.isArray(m['content'])) {
+      content = (m['content'] as Array<Record<string, unknown>>).map((part) => {
+        if (part && part['type'] === 'image_url') {
+          const imgObj = (part['imageUrl'] ?? part['image_url']) as
+            Record<string, unknown> | undefined;
+          const url = typeof imgObj?.['url'] === 'string' ? imgObj['url'] : '';
+          const detail = imgObj?.['detail'] as 'auto' | 'low' | 'high' | undefined;
+          return {
+            type: 'image_url' as const,
+            imageUrl: {
+              url,
+              ...(detail ? { detail } : {}),
+            },
+          };
+        }
+        if (part && part['type'] === 'text') {
+          return {
+            type: 'text' as const,
+            text: String(part['text'] ?? ''),
+          };
+        }
+        return part as unknown as ContentPart;
+      });
+    } else {
+      content = '';
+    }
+
     const msg: {
       role: NormalizedMessage['role'];
-      content: string | NormalizedMessage['content'];
+      content: string | readonly ContentPart[];
       name?: string;
       toolCallId?: string;
       toolCalls?: readonly ToolCall[];
     } = {
       role: String(m['role'] ?? 'user') as NormalizedMessage['role'],
-      content: (m['content'] as string | NormalizedMessage['content']) ?? '',
+      content,
     };
     if (typeof m['name'] === 'string') msg.name = m['name'];
     if (typeof m['tool_call_id'] === 'string') msg.toolCallId = m['tool_call_id'];

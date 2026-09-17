@@ -5,6 +5,8 @@ export interface ModelCapabilities {
   readonly supportsStructuredOutput: boolean;
   readonly maxContextTokens: number;
   readonly maxOutputTokens: number;
+  /** Optional estimated tokens consumed per image for context budget calculation */
+  readonly imageTokens?: number;
 }
 
 export interface ModelInfo {

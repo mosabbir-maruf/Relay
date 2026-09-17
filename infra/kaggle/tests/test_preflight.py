@@ -1176,18 +1176,20 @@ MODEL=gpt2
             url_file = os.path.join(tmpdir, "public_tunnel_url.txt")
 
             # Initially empty -> returns None
-            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir))
+            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir, require_alive=False))
 
             # Write newly created tunnel URL
             with open(url_file, "w", encoding="utf-8") as f:
                 f.write("https://fresh-tunnel-789.trycloudflare.com\n")
 
-            extracted = preflight.extract_tunnel_url(work_dir=tmpdir)
-            self.assertEqual(extracted, "https://fresh-tunnel-789.trycloudflare.com")
+            with mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running")):
+                extracted = preflight.extract_tunnel_url(work_dir=tmpdir)
+                self.assertEqual(extracted, "https://fresh-tunnel-789.trycloudflare.com")
 
             # Remove file (simulating stop_tunnel or start_tunnel cleanup)
-            os.remove(url_file)
-            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir))
+            if os.path.exists(url_file):
+                os.remove(url_file)
+            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir, require_alive=False))
 
     def test_resolve_canonical_tunnel_urls(self):
         """Tests resolve_canonical_tunnel_urls producing canonical PUBLIC_TUNNEL_URL and derived BASE_URL."""
@@ -1520,6 +1522,146 @@ MODEL=gpt2
         self.assertFalse(ready)
         self.assertIn("MODEL_NOT_FOUND", msg)
         self.assertIn("expected model 'gpt2' not found", msg)
+
+    def test_stale_quick_tunnel_url_invalidated_after_death(self):
+        """Tests that when cloudflared process dies, public_tunnel_url.txt is removed and None is returned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            url_file = os.path.join(tmpdir, "public_tunnel_url.txt")
+            pid_file = os.path.join(tmpdir, "cloudflared.pid")
+            with open(url_file, "w") as f:
+                f.write("https://stale-tunnel.trycloudflare.com\n")
+            with open(pid_file, "w") as f:
+                f.write("99999\n")
+
+            with mock.patch("preflight.check_cloudflared_process_alive") as mock_alive:
+                mock_alive.return_value = (False, 99999, "cloudflared process PID 99999 does not exist")
+                extracted = preflight.extract_tunnel_url(work_dir=tmpdir, require_alive=True)
+                self.assertIsNone(extracted)
+                self.assertFalse(os.path.exists(url_file))
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running"))
+    @mock.patch("urllib.request.urlopen")
+    def test_verify_tunnel_readiness_detects_cloudflare_530_tunnel_disconnect(
+        self, mock_urlopen, mock_proc, mock_pub, mock_local, mock_tcp, mock_sleep
+    ):
+        """Tests that HTTP 530 with error 1033 is correctly diagnosed as CLOUDFLARE_TUNNEL_DISCONNECTED."""
+        err = urllib.error.HTTPError(
+            url="https://test-host.trycloudflare.com/v1/models",
+            code=530,
+            msg="Origin DNS Error",
+            hdrs={},
+            fp=mock.MagicMock(),
+        )
+        err.fp.read.return_value = b"<html>error code: 1033<br>Cloudflare Tunnel error</html>"
+        mock_urlopen.side_effect = err
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-host.trycloudflare.com",
+            timeout_secs=2,
+            poll_interval=0.1,
+            pid=1234,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(data)
+        self.assertIn("CLOUDFLARE_TUNNEL_DISCONNECTED", msg)
+        self.assertIn("1033", msg)
+        self.assertIn("Cloudflare tunnel is disconnected", msg)
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running"))
+    @mock.patch("urllib.request.urlopen")
+    def test_verify_tunnel_readiness_detects_generic_530_origin_error(
+        self, mock_urlopen, mock_proc, mock_pub, mock_local, mock_tcp, mock_sleep
+    ):
+        """Tests that HTTP 530 without tunnel disconnect evidence is classified as generic Cloudflare origin error."""
+        err = urllib.error.HTTPError(
+            url="https://models.myrelay.ai/v1/models",
+            code=530,
+            msg="Origin DNS Error",
+            hdrs={},
+            fp=mock.MagicMock(),
+        )
+        err.fp.read.return_value = b"<html>error code: 1016<br>Origin DNS resolution error</html>"
+        mock_urlopen.side_effect = err
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://models.myrelay.ai",
+            timeout_secs=2,
+            poll_interval=0.1,
+            pid=1234,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(data)
+        self.assertIn("CLOUDFLARE_530_ORIGIN_ERROR_1016", msg)
+        self.assertNotIn("CLOUDFLARE_TUNNEL_DISCONNECTED", msg)
+        self.assertIn("Origin DNS or host resolution failed", msg)
+
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["198.41.200.1"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["198.41.200.1"], "ok"))
+    @mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running"))
+    @mock.patch("urllib.request.urlopen")
+    def test_named_tunnel_hostname_readiness_verification(
+        self, mock_urlopen, mock_proc, mock_pub, mock_local, mock_tcp
+    ):
+        """Tests that a Named Tunnel custom domain completes readiness verification through DNS, TLS, and HTTP 200."""
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"data": [{"id": "smolvlm2"}]}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://models.custom-domain.com",
+            expected_model="smolvlm2",
+            pid=1234,
+        )
+
+        self.assertTrue(ready)
+        self.assertIn("[READY]", msg)
+        self.assertIn("models.custom-domain.com", msg)
+        self.assertNotIn("QUICK_TUNNEL_SSE_LIMITATION", msg)
+        self.assertIsNotNone(data)
+
+    def test_get_tunnel_sse_diagnostic(self):
+        """Tests get_tunnel_sse_diagnostic emits notice for trycloudflare.com and None for custom/named tunnels."""
+        quick_diag = preflight.get_tunnel_sse_diagnostic("https://random-words-123.trycloudflare.com")
+        self.assertIsNotNone(quick_diag)
+        self.assertIn("QUICK_TUNNEL_SSE_LIMITATION", quick_diag)
+        self.assertIn("Quick Tunnels do not support Server-Sent Events (SSE)", quick_diag)
+
+        named_diag = preflight.get_tunnel_sse_diagnostic("https://models.myrelay.ai")
+        self.assertIsNone(named_diag)
+
+        self.assertIsNone(preflight.get_tunnel_sse_diagnostic(None))
+        self.assertIsNone(preflight.get_tunnel_sse_diagnostic(""))
+
+    def test_redact_secrets_protects_tunnel_token(self):
+        """Tests redact_secrets sanitizes Cloudflare tunnel tokens and Hugging Face tokens."""
+        raw_jwt = "eyJhGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.some_signature_value_here"
+        sample_log = f"cloudflared tunnel run --token {raw_jwt} --url http://127.0.0.1:8000"
+        redacted = preflight.redact_secrets(sample_log)
+        self.assertNotIn(raw_jwt, redacted)
+        self.assertIn("[REDACTED_TUNNEL_TOKEN]", redacted)
+
+        env_sample = f"CLOUDFLARE_TUNNEL_TOKEN={raw_jwt}"
+        redacted_env = preflight.redact_secrets(env_sample)
+        self.assertNotIn(raw_jwt, redacted_env)
+        self.assertIn("[REDACTED_TUNNEL_TOKEN]", redacted_env)
+
+        hf_sample = "export HF_TOKEN=hf_abcdef1234567890123456789012345678"
+        redacted_hf = preflight.redact_secrets(hf_sample)
+        self.assertNotIn("hf_abcdef1234567890123456789012345678", redacted_hf)
+        self.assertIn("[REDACTED_HF_TOKEN]", redacted_hf)
 
 
 class TestProcessorDependencies(unittest.TestCase):

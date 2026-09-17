@@ -767,17 +767,36 @@ def validate_tunnel_url(url: Optional[str]) -> Tuple[bool, str]:
     return True, ""
 
 
+def redact_secrets(text: str) -> str:
+    """
+    Redacts sensitive tokens, API keys, and Cloudflare tunnel tokens from strings.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    # Redact Cloudflare tunnel tokens (base64 JWTs starting with eyJh...)
+    text = re.sub(r"(eyJh[A-Za-z0-9_-]{30,})", "[REDACTED_TUNNEL_TOKEN]", text)
+    text = re.sub(r"(--token\s+)[^\s]+", r"\1[REDACTED_TUNNEL_TOKEN]", text)
+    text = re.sub(r"(CLOUDFLARE_TUNNEL_TOKEN\s*=\s*)[^\s\"']+", r"\1[REDACTED_TUNNEL_TOKEN]", text)
+    # Redact Hugging Face tokens
+    text = re.sub(r"(hf_[A-Za-z0-9]{30,})", "[REDACTED_HF_TOKEN]", text)
+    return text
+
+
 def extract_tunnel_url(
     output_or_text: Optional[str] = None,
     work_dir: Optional[str] = None,
+    require_alive: bool = True,
 ) -> Optional[str]:
     """
-    Captures the public Cloudflare Quick Tunnel URL authoritatively.
+    Captures the public Cloudflare tunnel URL authoritatively.
     Checks in order:
     1. Shell output text (e.g. from cloudflared.sh start / url)
     2. Persisted URL file WORK_DIR/public_tunnel_url.txt
     3. Log file WORK_DIR/cloudflared.log (latest trycloudflare.com match)
     4. Environment variable PUBLIC_TUNNEL_URL or PUBLIC_URL
+
+    When require_alive=True and reading from stored files/logs, verifies the
+    cloudflared daemon process is alive to prevent reusing stale URLs from dead processes.
     Returns the validated, clean https://... URL string, or None.
     """
     candidates: List[str] = []
@@ -787,6 +806,7 @@ def extract_tunnel_url(
         for pattern in [
             r"(?:PUBLIC_TUNNEL_URL|PUBLIC_URL)\s*=\s*([^\s\"']+)",
             r"Public URL:\s*([^\s\"']+)",
+            r"Configured Hostname:\s*([^\s\"']+)",
             r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)",
         ]:
             matches = re.findall(pattern, output_or_text, flags=re.IGNORECASE)
@@ -794,26 +814,41 @@ def extract_tunnel_url(
                 candidates.append(m.strip())
 
     effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
-    url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
-    if os.path.exists(url_file):
-        try:
-            with open(url_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            if content:
-                candidates.append(content)
-        except Exception:
-            pass
 
-    log_file = os.path.join(effective_work_dir, "cloudflared.log")
-    if os.path.exists(log_file):
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                log_content = f.read()
-            matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", log_content)
-            for m in reversed(matches):
-                candidates.append(m.strip())
-        except Exception:
-            pass
+    # If reading from filesystem and require_alive=True, verify daemon is running
+    is_alive = True
+    if require_alive:
+        is_alive, _, _ = check_cloudflared_process_alive(work_dir=effective_work_dir)
+
+    if is_alive:
+        url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
+        if os.path.exists(url_file):
+            try:
+                with open(url_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    candidates.append(content)
+            except Exception:
+                pass
+
+        log_file = os.path.join(effective_work_dir, "cloudflared.log")
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    log_content = f.read()
+                matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", log_content)
+                for m in reversed(matches):
+                    candidates.append(m.strip())
+            except Exception:
+                pass
+    else:
+        # Process is dead: remove stale public_tunnel_url.txt
+        url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
+        if os.path.exists(url_file):
+            try:
+                os.remove(url_file)
+            except Exception:
+                pass
 
     for env_var in ["PUBLIC_TUNNEL_URL", "PUBLIC_URL"]:
         v = os.environ.get(env_var)
@@ -847,6 +882,23 @@ def resolve_canonical_tunnel_urls(tunnel_url: Optional[str]) -> Dict[str, str]:
     }
 
 
+def get_tunnel_sse_diagnostic(tunnel_url: Optional[str]) -> Optional[str]:
+    """
+    Returns an explicit diagnostic notice if the tunnel URL is a Cloudflare Quick Tunnel.
+    Quick Tunnels do not support Server-Sent Events (SSE).
+    """
+    if not tunnel_url:
+        return None
+    clean = clean_tunnel_url(tunnel_url)
+    if "trycloudflare.com" in clean.lower():
+        return (
+            "[QUICK_TUNNEL_SSE_LIMITATION] Quick Tunnels do not support Server-Sent Events (SSE).\n"
+            "In Relay Playground, uncheck 'Stream' in settings for standard non-streaming completions.\n"
+            "For persistent endpoints and real-time streaming, configure a Named Cloudflare Tunnel."
+        )
+    return None
+
+
 def check_cloudflared_process_alive(
     pid: Optional[int] = None,
     work_dir: Optional[str] = None,
@@ -854,6 +906,7 @@ def check_cloudflared_process_alive(
     """
     Verifies if the cloudflared daemon process is currently running.
     Checks explicit pid or parses WORK_DIR/cloudflared.pid.
+    When process death is confirmed, cleans up stale public_tunnel_url.txt and cloudflared.pid.
     Returns (is_alive: bool, pid: Optional[int], status_message: str).
     """
     effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
@@ -871,13 +924,33 @@ def check_cloudflared_process_alive(
                 pass
 
     if target_pid is None:
-        return False, None, "No cloudflared PID file found"
+        # Also ensure stale url file is removed if no PID file exists
+        url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
+        if os.path.exists(url_file):
+            try:
+                os.remove(url_file)
+            except Exception:
+                pass
+        return False, None, "No cloudflared PID file found (stale URL invalidated)"
 
     try:
         os.kill(target_pid, 0)
         return True, target_pid, f"cloudflared is running (PID {target_pid})"
     except ProcessLookupError:
-        return False, target_pid, f"cloudflared process PID {target_pid} does not exist"
+        # Clean up stale files
+        url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
+        if os.path.exists(url_file):
+            try:
+                os.remove(url_file)
+            except Exception:
+                pass
+        pid_file = os.path.join(effective_work_dir, "cloudflared.pid")
+        if os.path.exists(pid_file):
+            try:
+                os.remove(pid_file)
+            except Exception:
+                pass
+        return False, target_pid, f"cloudflared process PID {target_pid} does not exist (stale URL invalidated)"
     except PermissionError:
         return True, target_pid, f"cloudflared process PID {target_pid} exists (permission denied to signal)"
     except OSError as e:
@@ -889,7 +962,7 @@ def get_cloudflared_recent_logs(
     lines: int = 25,
 ) -> str:
     """
-    Reads the trailing lines from WORK_DIR/cloudflared.log.
+    Reads the trailing lines from WORK_DIR/cloudflared.log with sensitive tokens redacted.
     """
     effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
     log_file = os.path.join(effective_work_dir, "cloudflared.log")
@@ -900,7 +973,8 @@ def get_cloudflared_recent_logs(
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
-        return "".join(tail).strip() or "(cloudflared.log is empty)"
+        raw_text = "".join(tail).strip() or "(cloudflared.log is empty)"
+        return redact_secrets(raw_text)
     except Exception as e:
         return f"(failed to read cloudflared.log: {e})"
 
@@ -1187,6 +1261,7 @@ def verify_tunnel_readiness(
                                     f"HTTP 200 returned, but expected model '{expected_model}' not found in {models}"
                                 )
                             else:
+                                sse_diag = get_tunnel_sse_diagnostic(clean_url)
                                 msg = (
                                     f"[READY] Tunnel is fully verified and responsive in {elapsed}s (HTTP 200).\n"
                                     f"Hostname: {hostname}\n"
@@ -1195,13 +1270,41 @@ def verify_tunnel_readiness(
                                     f"Endpoint: {test_endpoint}\n"
                                     f"Models: {models}"
                                 )
+                                if sse_diag:
+                                    msg += f"\n{sse_diag}"
                                 return True, msg, data
                         else:
                             last_stage = "HTTP_UPSTREAM_WARMUP"
                             last_diag = f"Endpoint returned HTTP {resp.status}"
                 except urllib.error.HTTPError as e:
-                    last_stage = "HTTP_ERROR"
-                    last_diag = f"HTTP {e.code}: {e.reason}"
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+                    cf_match = re.search(r"\b(1\d{3})\b", f"{e.reason} {body}")
+                    cf_code = cf_match.group(1) if cf_match else None
+
+                    if e.code == 530:
+                        has_tunnel_evidence = (
+                            cf_code == "1033"
+                            or "1033" in body
+                            or "cloudflare tunnel error" in body.lower()
+                            or "argo tunnel error" in body.lower()
+                            or ("trycloudflare.com" in hostname and ("tunnel" in body.lower() or "origin dns error" in body.lower()))
+                        )
+                        if has_tunnel_evidence:
+                            last_stage = "CLOUDFLARE_TUNNEL_DISCONNECTED"
+                            last_diag = (
+                                f"HTTP 530 (Cloudflare Error {cf_code or '1033'}): Cloudflare tunnel is disconnected. "
+                                f"The cloudflared daemon or upstream connector is unavailable."
+                            )
+                        else:
+                            last_stage = f"CLOUDFLARE_530_ORIGIN_ERROR_{cf_code}" if cf_code else "CLOUDFLARE_530_ORIGIN_ERROR"
+                            last_diag = f"HTTP 530{f' (Cloudflare Error {cf_code})' if cf_code else ''}: Origin DNS or host resolution failed."
+                    else:
+                        last_stage = "HTTP_ERROR"
+                        last_diag = f"HTTP {e.code}: {e.reason}{f' (Cloudflare Error {cf_code})' if cf_code else ''}"
                 except urllib.error.URLError as e:
                     last_stage = "HTTP_CONNECTION_ERROR"
                     last_diag = f"HTTP connection failed: {e.reason}"

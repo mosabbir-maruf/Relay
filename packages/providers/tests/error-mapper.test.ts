@@ -133,4 +133,106 @@ describe('Upstream Error Mapper Hardening', () => {
     expect(error).toBeInstanceOf(RelayTimeoutError);
     expect(error.statusCode).toBe(504);
   });
+
+  it('maps HTTP 530 with Error 1033 to CLOUDFLARE_TUNNEL_DISCONNECTED', () => {
+    const cfHtml1033 = `
+      <!DOCTYPE html>
+      <html>
+      <head><title>Argo Tunnel error | error code: 1033</title></head>
+      <body>
+        <h1>Error 1033</h1>
+        <p>Argo Tunnel error</p>
+        <p>The tunnel you requested does not exist or has disconnected.</p>
+      </body>
+      </html>
+    `;
+
+    const error = mapHttpStatusToRelayError({
+      provider: 'vllm',
+      status: 530,
+      statusText: 'Origin DNS error',
+      bodyText: cfHtml1033,
+    });
+
+    expect(error).toBeInstanceOf(RelayProviderUnavailableError);
+    expect(error.statusCode).toBe(503);
+    expect(error.message).toContain('Cloudflare tunnel disconnected or inactive');
+    expect(error.message).toContain('1033');
+    expect(error.details).toEqual({
+      provider: 'vllm',
+      status: 530,
+      code: 'CLOUDFLARE_TUNNEL_DISCONNECTED',
+      cloudflareCode: '1033',
+    });
+  });
+
+  it('maps generic HTTP 530 without 1033 to generic Cloudflare origin-resolution error', () => {
+    const cfHtml1016 = `
+      <!DOCTYPE html>
+      <html>
+      <head><title>Origin DNS error | error code: 1016</title></head>
+      <body>
+        <h1>Error 1016</h1>
+        <p>Origin DNS error: DNS lookup failed.</p>
+      </body>
+      </html>
+    `;
+
+    const error = mapHttpStatusToRelayError({
+      provider: 'vllm',
+      status: 530,
+      statusText: 'Origin DNS error',
+      bodyText: cfHtml1016,
+    });
+
+    expect(error).toBeInstanceOf(RelayProviderUnavailableError);
+    expect(error.statusCode).toBe(503);
+    expect(error.message).toContain('Cloudflare origin resolution error');
+    expect(error.message).toContain('1016');
+    expect(error.details).toEqual({
+      provider: 'vllm',
+      status: 530,
+      code: 'CLOUDFLARE_ERROR_1016',
+      cloudflareCode: '1016',
+    });
+  });
+
+  it('maps generic HTTP 530 without any 1xxx code to CLOUDFLARE_ORIGIN_DNS_ERROR', () => {
+    const error = mapHttpStatusToRelayError({
+      provider: 'vllm',
+      status: 530,
+      statusText: 'Origin DNS error',
+      bodyText: 'Plain origin error',
+    });
+
+    expect(error).toBeInstanceOf(RelayProviderUnavailableError);
+    expect(error.statusCode).toBe(503);
+    expect(error.message).toContain('Cloudflare origin resolution error');
+    expect(error.details).toEqual({
+      provider: 'vllm',
+      status: 530,
+      code: 'CLOUDFLARE_ORIGIN_DNS_ERROR',
+    });
+  });
+
+  it('redacts CLOUDFLARE_TUNNEL_TOKEN from error messages and details', () => {
+    const secretToken = 'eyJhIjoiYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTYiLCJ0IjoiZGVmNDU2In0=';
+    const jsonWithToken = JSON.stringify({
+      error: {
+        message: `Failed to connect with tunnel_token: ${secretToken}`,
+        code: `token_${secretToken}`,
+      },
+    });
+
+    const error = mapHttpStatusToRelayError({
+      provider: 'vllm',
+      status: 502,
+      statusText: 'Bad Gateway',
+      bodyText: jsonWithToken,
+    });
+
+    expect(error.message).not.toContain(secretToken);
+    expect(error.message).toContain('[REDACTED]');
+    expect(JSON.stringify(error.details)).not.toContain(secretToken);
+  });
 });

@@ -252,4 +252,81 @@ describe('GET /v1/models', () => {
     expect(body.id).toBe('llama-3');
     expect(body.max_model_len).toBe(8192);
   });
+
+  it('annotates is_quick_tunnel: true for trycloudflare endpoints and omits it for named/standard providers', async () => {
+    const config = loadConfig({ LOG_LEVEL: 'silent' });
+    const registry = new ProviderRegistry();
+
+    class QuickTunnelProvider extends TestMockProvider {
+      readonly baseUrl = 'https://ephemeral-host.trycloudflare.com/v1';
+      readonly isQuickTunnel = true;
+    }
+
+    class NamedTunnelProvider extends TestMockProvider {
+      readonly baseUrl = 'https://models.myrelay.ai/v1';
+      readonly isQuickTunnel = false;
+    }
+
+    const quickProvider = new QuickTunnelProvider('quick-provider');
+    const namedProvider = new NamedTunnelProvider('named-provider');
+
+    registry.registerProvider(quickProvider);
+    registry.registerProvider(namedProvider);
+
+    registry.registerModel({
+      id: 'quick-model',
+      name: 'Quick Model',
+      provider: 'quick-provider',
+      capabilities: quickProvider.getCapabilities('quick-model'),
+    });
+
+    registry.registerModel({
+      id: 'named-model',
+      name: 'Named Model',
+      provider: 'named-provider',
+      capabilities: namedProvider.getCapabilities('named-model'),
+    });
+
+    const app = await createApp({
+      config,
+      registry,
+      serverOptions: { logger: false },
+    });
+
+    // 1. List models
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models',
+    });
+    expect(listRes.statusCode).toBe(200);
+    const listBody = JSON.parse(listRes.body);
+    const quickModel = listBody.data.find((m: { id: string }) => m.id === 'quick-model');
+    const namedModel = listBody.data.find((m: { id: string }) => m.id === 'named-model');
+
+    expect(quickModel).toBeDefined();
+    expect(quickModel.is_quick_tunnel).toBe(true);
+
+    expect(namedModel).toBeDefined();
+    expect(namedModel.is_quick_tunnel).toBeUndefined();
+
+    // 2. Single model endpoint for quick tunnel
+    const quickRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models/quick-model',
+    });
+    expect(quickRes.statusCode).toBe(200);
+    const quickData = JSON.parse(quickRes.body);
+    expect(quickData.id).toBe('quick-model');
+    expect(quickData.is_quick_tunnel).toBe(true);
+
+    // 3. Single model endpoint for named tunnel
+    const namedRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models/named-model',
+    });
+    expect(namedRes.statusCode).toBe(200);
+    const namedData = JSON.parse(namedRes.body);
+    expect(namedData.id).toBe('named-model');
+    expect(namedData.is_quick_tunnel).toBeUndefined();
+  });
 });

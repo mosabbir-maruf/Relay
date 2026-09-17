@@ -24,9 +24,23 @@ function sanitizeErrorMessage(msg: string): string {
   return msg
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED]')
     .replace(/(api[_-]?key[:=\s]+)[A-Za-z0-9._~-]+/gi, '$1[REDACTED]')
+    .replace(/(tunnel[_-]?token[:=\s]+)[A-Za-z0-9._~-]+/gi, '$1[REDACTED]')
     .replace(/(AIza[0-9A-Za-z-_]{20,})/g, '[REDACTED]')
     .replace(/(sk-[a-zA-Z0-9_-]{20,})/g, '[REDACTED]')
+    .replace(/(eyJh[A-Za-z0-9_-]{30,})/g, '[REDACTED]')
     .slice(0, 500);
+}
+
+/**
+ * Extracts Cloudflare 1xxx error code (e.g. 1033, 1016, 1000) from error body or text.
+ */
+function extractCloudflareErrorCode(bodyText?: string, statusText?: string): string | undefined {
+  if (!bodyText && !statusText) return undefined;
+  const combined = `${statusText ?? ''} ${bodyText ?? ''}`;
+  const match =
+    combined.match(/error\s*(?:code:?\s*)?(\b1\d{3}\b)/i) ??
+    combined.match(/\b(1033|1016|1000|1001|1002|1003|1004|1014|1015|1020)\b/);
+  return match ? match[1] : undefined;
 }
 
 /**
@@ -77,14 +91,42 @@ export function mapHttpStatusToRelayError(context: UpstreamErrorContext): RelayE
     }
   }
 
+  // Check for Cloudflare 1xxx code
+  const cfCode = extractCloudflareErrorCode(bodyText, statusText);
+
+  // Cloudflare HTTP 530 Handling:
+  // Distinguish tunnel-disconnected (evidence of 1033 / tunnel error / trycloudflare disconnect)
+  // from generic Cloudflare origin DNS / host resolution error.
+  let cfMessage: string | undefined;
+
+  if (status === 530) {
+    const lowerBody = (bodyText ?? '').toLowerCase();
+    const hasTunnelEvidence =
+      cfCode === '1033' ||
+      lowerBody.includes('1033') ||
+      lowerBody.includes('cloudflare tunnel error') ||
+      lowerBody.includes('argo tunnel error') ||
+      (lowerBody.includes('trycloudflare.com') &&
+        (lowerBody.includes('tunnel') || lowerBody.includes('origin dns error')));
+
+    if (hasTunnelEvidence) {
+      providerCode = 'CLOUDFLARE_TUNNEL_DISCONNECTED';
+      cfMessage = `Cloudflare tunnel disconnected or inactive (HTTP 530${cfCode ? `, Cloudflare error ${cfCode}` : ''}). The remote Kaggle notebook or cloudflared daemon may have stopped. Please check your Kaggle session or restart the tunnel.`;
+    } else {
+      providerCode = cfCode ? `CLOUDFLARE_ERROR_${cfCode}` : 'CLOUDFLARE_ORIGIN_DNS_ERROR';
+      cfMessage = `Cloudflare origin resolution error (HTTP 530${cfCode ? `, Cloudflare error ${cfCode}` : ''}): Origin DNS or host resolution failed.`;
+    }
+  }
+
   const sanitizedMessage = rawExtractedMessage
     ? sanitizeErrorMessage(rawExtractedMessage)
     : undefined;
 
   const message =
-    sanitizedMessage && sanitizedMessage.length > 0
+    cfMessage ??
+    (sanitizedMessage && sanitizedMessage.length > 0
       ? sanitizedMessage
-      : `Upstream provider "${provider}" returned HTTP ${status}: ${statusText}`;
+      : `Upstream provider "${provider}" returned HTTP ${status}: ${statusText}`);
 
   // Build safe allowlisted details dictionary
   const safeDetails: Record<string, unknown> = {
@@ -96,6 +138,9 @@ export function mapHttpStatusToRelayError(context: UpstreamErrorContext): RelayE
   }
   if (providerType) {
     safeDetails['type'] = sanitizeErrorMessage(providerType);
+  }
+  if (cfCode) {
+    safeDetails['cloudflareCode'] = cfCode;
   }
 
   switch (status) {
@@ -116,6 +161,11 @@ export function mapHttpStatusToRelayError(context: UpstreamErrorContext): RelayE
       });
     case 504:
       return new RelayTimeoutError(message, { details: safeDetails });
+    case 530:
+      return new RelayProviderUnavailableError(message, {
+        statusCode: 503,
+        details: safeDetails,
+      });
     case 502:
     case 503:
     default:

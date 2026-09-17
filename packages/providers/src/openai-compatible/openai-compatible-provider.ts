@@ -51,7 +51,8 @@ export interface UpstreamModelMetadata {
 export class OpenAICompatibleProvider implements LLMProvider {
   readonly id: string;
   readonly name: string;
-  private readonly baseUrl: string;
+  readonly baseUrl: string;
+  readonly isQuickTunnel: boolean;
   private readonly apiKey?: string | undefined;
   private readonly customHeaders: Record<string, string>;
   private readonly capabilities: ProviderCapabilities;
@@ -62,6 +63,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     this.name = config.name ?? 'OpenAI Compatible';
     // Remove trailing slash if present
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
+    this.isQuickTunnel = this.baseUrl.toLowerCase().includes('.trycloudflare.com');
     this.apiKey = config.apiKey;
     this.customHeaders = config.customHeaders ?? {};
     this.capabilities = {
@@ -134,6 +136,27 @@ export class OpenAICompatibleProvider implements LLMProvider {
           isHealthy: true,
           latencyMs,
           lastChecked: new Date(),
+        };
+      }
+
+      if (response.status === 530) {
+        const bodyText = await response.text().catch(() => '');
+        const cfCode =
+          bodyText.match(/error\s*(?:code:?\s*)?(\b1\d{3}\b)/i)?.[1] ??
+          bodyText.match(/\b(1033|1016|1000|1001|1002)\b/)?.[1];
+        const hasTunnelEvidence =
+          cfCode === '1033' ||
+          bodyText.toLowerCase().includes('1033') ||
+          bodyText.toLowerCase().includes('cloudflare tunnel error') ||
+          this.isQuickTunnel;
+        const errorMessage = hasTunnelEvidence
+          ? `Cloudflare tunnel disconnected or inactive (HTTP 530${cfCode ? `, code ${cfCode}` : ''}). Kaggle notebook or cloudflared daemon may have stopped.`
+          : `Cloudflare origin resolution error (HTTP 530${cfCode ? `, code ${cfCode}` : ''}). Origin DNS or host resolution failed.`;
+        return {
+          isHealthy: false,
+          latencyMs,
+          lastChecked: new Date(),
+          errorMessage,
         };
       }
 
@@ -274,9 +297,30 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const payload: Record<string, unknown> = {
       model: request.model,
       messages: request.messages.map((m) => {
+        let content: unknown = m.content;
+        if (Array.isArray(m.content)) {
+          content = m.content.map((part) => {
+            if (part.type === 'image_url') {
+              return {
+                type: 'image_url',
+                image_url: {
+                  url: part.imageUrl.url,
+                  ...(part.imageUrl.detail ? { detail: part.imageUrl.detail } : {}),
+                },
+              };
+            }
+            if (part.type === 'text') {
+              return {
+                type: 'text',
+                text: part.text,
+              };
+            }
+            return part;
+          });
+        }
         const msg: Record<string, unknown> = {
           role: m.role,
-          content: m.content,
+          content,
         };
         if (m.name) msg['name'] = m.name;
         if (m.toolCallId) msg['tool_call_id'] = m.toolCallId;

@@ -45,10 +45,25 @@ ensure_binary() {
 }
 
 extract_url() {
+  # Verify daemon liveness first; stale URLs from dead processes must never be returned
+  if [ -f "${PID_FILE}" ]; then
+    local check_pid
+    check_pid=$(cat "${PID_FILE}" 2>/dev/null || true)
+    if [ -z "${check_pid}" ] || ! kill -0 "${check_pid}" 2>/dev/null; then
+      rm -f "${URL_FILE}" "${PID_FILE}"
+      echo "ERROR: cloudflared process is not running. Stale tunnel URL invalidated." >&2
+      return 1
+    fi
+  else
+    rm -f "${URL_FILE}"
+    echo "ERROR: cloudflared is not running (no PID file). Stale tunnel URL invalidated." >&2
+    return 1
+  fi
+
   if [ -f "${URL_FILE}" ]; then
     local cached_url
     cached_url=$(cat "${URL_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ "${cached_url}" =~ ^https://[a-zA-Z0-9-]+\.trycloudflare\.com ]]; then
+    if [[ "${cached_url}" =~ ^https?://[a-zA-Z0-9.-]+ ]]; then
       echo "${cached_url}"
       return 0
     fi
@@ -93,9 +108,47 @@ start_tunnel() {
     fi
   fi
 
-  echo "Starting Cloudflare Quick Tunnel pointing to ${LOCAL_TARGET}..."
   rm -f "${LOG_FILE}" "${PID_FILE}" "${URL_FILE}"
 
+  # Optional Named/Managed Cloudflare Tunnel (production mode with token & custom domain)
+  if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+    echo "Starting Named Cloudflare Tunnel (token-configured)..."
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "${BIN_PATH}" tunnel --no-autoupdate run --token "${CLOUDFLARE_TUNNEL_TOKEN}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
+    else
+      nohup "${BIN_PATH}" tunnel --no-autoupdate run --token "${CLOUDFLARE_TUNNEL_TOKEN}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
+    fi
+    local pid=$!
+    disown -a 2>/dev/null || true
+    echo "${pid}" > "${PID_FILE}"
+    echo "cloudflared named tunnel process launched (PID ${pid})"
+
+    local named_hostname="${CLOUDFLARE_TUNNEL_HOSTNAME:-}"
+    if [ -n "${named_hostname}" ]; then
+      local named_url="${named_hostname}"
+      if [[ ! "${named_url}" =~ ^https?:// ]]; then
+        named_url="https://${named_url}"
+      fi
+      echo "${named_url}" > "${URL_FILE}" 2>/dev/null || true
+      echo -e "\n========================================================"
+      echo "Cloudflare Named Tunnel launched with provided token."
+      echo "Configured Hostname: ${named_url}"
+      echo "Base URL:            ${named_url}/v1"
+      echo "NOTE: Hostname routing must be verified (DNS -> TCP/TLS -> HTTP -> /v1/models)."
+      echo "========================================================"
+      echo "PUBLIC_URL=${named_url}"
+      echo "BASE_URL=${named_url}/v1"
+      echo "PUBLIC_TUNNEL_URL=${named_url}"
+      echo "VLLM_BASE_URL=${named_url}/v1"
+      return 0
+    else
+      echo "WARNING: Named tunnel started, but CLOUDFLARE_TUNNEL_HOSTNAME not set."
+      echo "Please export CLOUDFLARE_TUNNEL_HOSTNAME to establish canonical endpoint URL."
+      return 0
+    fi
+  fi
+
+  echo "Starting Cloudflare Quick Tunnel pointing to ${LOCAL_TARGET}..."
   if command -v setsid >/dev/null 2>&1; then
     setsid "${BIN_PATH}" tunnel --url "${LOCAL_TARGET}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
   else
@@ -125,6 +178,9 @@ start_tunnel() {
     echo "Public URL: ${tunnel_url}"
     echo "Base URL:   ${tunnel_url}/v1"
     echo "NOTE: Public hostname propagation & endpoint readiness must be verified."
+    echo "DIAGNOSTIC: Quick Tunnels do not support Server-Sent Events (SSE)."
+    echo "            In Relay Playground, uncheck 'Stream' for non-streaming completions."
+    echo "            For persistent endpoints and SSE streaming, use a Named Cloudflare Tunnel."
     echo "========================================================"
     echo "PUBLIC_URL=${tunnel_url}"
     echo "BASE_URL=${tunnel_url}/v1"
@@ -162,7 +218,7 @@ status_tunnel() {
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       echo "cloudflared: RUNNING (PID ${pid})"
       local url
-      url=$(extract_url 2>/dev/null || true)
+      url=$(cat "${URL_FILE}" 2>/dev/null || true)
       if [ -n "${url}" ]; then
         echo "Public URL: ${url}"
       else
@@ -170,9 +226,14 @@ status_tunnel() {
       fi
       return 0
     fi
+    # Recorded PID is dead
+    rm -f "${PID_FILE}" "${URL_FILE}"
+    echo "cloudflared: DEAD (recorded PID ${pid} is not running; stale URL invalidated)"
+    return 1
   fi
 
-  echo "cloudflared: NOT RUNNING"
+  rm -f "${URL_FILE}"
+  echo "cloudflared: NOT RUNNING (no PID file; stale URL invalidated)"
   return 1
 }
 

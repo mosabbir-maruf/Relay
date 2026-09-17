@@ -649,6 +649,142 @@ export function renderPlaygroundHtml(): string {
       gap: 8px;
     }
 
+    .composer-input-box.drag-over {
+      border-color: var(--accent-emerald);
+      background: rgba(16, 185, 129, 0.05);
+    }
+
+    .image-preview-container {
+      display: none;
+      margin-bottom: 8px;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .image-preview-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 8px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      max-width: fit-content;
+    }
+
+    .image-preview-thumb {
+      width: 36px;
+      height: 36px;
+      object-fit: cover;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+      flex-shrink: 0;
+    }
+
+    .image-preview-details {
+      display: flex;
+      flex-direction: column;
+      font-size: 11px;
+      min-width: 0;
+    }
+
+    .image-preview-name {
+      max-width: 180px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .image-preview-size {
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 10px;
+    }
+
+    .remove-image-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 2px 4px;
+      font-size: 12px;
+      border-radius: 4px;
+      transition: color 0.15s, background-color 0.15s;
+    }
+
+    .remove-image-btn:hover {
+      color: var(--accent-red);
+      background: var(--accent-red-dim);
+    }
+
+    .image-unsupported-warning {
+      font-size: 11px;
+      color: var(--accent-amber);
+      display: none;
+      align-items: center;
+      gap: 4px;
+      margin-top: 2px;
+    }
+
+    .composer-attach-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+      border-radius: 4px;
+      background: transparent;
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .composer-attach-btn:hover:not(:disabled) {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+      border-color: var(--border-hover);
+    }
+
+    .composer-attach-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      border-color: transparent;
+    }
+
+    .message-image-container {
+      margin-bottom: 8px;
+      max-width: 320px;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+    }
+
+    .message-image-preview {
+      max-width: 100%;
+      max-height: 240px;
+      display: block;
+      object-fit: contain;
+    }
+
+    .message-image-placeholder {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      margin-bottom: 6px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      background: var(--bg-surface);
+      border: 1px dashed var(--border-subtle);
+      border-radius: 4px;
+    }
+
     /* Sidebar / Settings */
     #settings-sidebar {
       width: 320px;
@@ -869,7 +1005,20 @@ export function renderPlaygroundHtml(): string {
         <!-- Composer -->
         <div id="composer-container">
           <div class="composer-inner">
-            <div class="composer-input-box">
+            <div class="composer-input-box" id="composer-input-box">
+              <div id="image-preview-container" class="image-preview-container" style="display: none;">
+                <div class="image-preview-chip">
+                  <img id="image-preview-thumb" class="image-preview-thumb" src="" alt="Preview" />
+                  <div class="image-preview-details">
+                    <span id="image-preview-name" class="image-preview-name"></span>
+                    <span id="image-preview-size" class="image-preview-size"></span>
+                  </div>
+                  <button id="remove-image-btn" class="remove-image-btn" title="Remove attached image" type="button">✕</button>
+                </div>
+                <div id="image-unsupported-warning" class="image-unsupported-warning" style="display: none;">
+                  ⚠️ Selected model does not support image input. Please remove attachment or switch models.
+                </div>
+              </div>
               <textarea
                 id="chat-textarea"
                 placeholder="Send a message... (Enter to send, Shift+Enter for newline)"
@@ -877,6 +1026,15 @@ export function renderPlaygroundHtml(): string {
               ></textarea>
               <div class="composer-toolbar">
                 <div class="composer-hints">
+                  <button id="attach-image-btn" class="composer-attach-btn" type="button" title="Attach image (PNG, JPEG, WebP)">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>
+                      <circle cx="9" cy="9" r="2"/>
+                      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
+                    </svg>
+                    <span>Image</span>
+                  </button>
+                  <input type="file" id="image-file-input" accept="image/png,image/jpeg,image/webp" style="display: none;" />
                   <span id="char-token-counter">0 tokens • 0 chars</span>
                   <span style="opacity: 0.6;">↵ Send • ⇧↵ Newline</span>
                 </div>
@@ -949,6 +1107,9 @@ export function renderPlaygroundHtml(): string {
               <span class="slider-track"></span>
             </label>
           </div>
+          <div id="quick-tunnel-sse-warning" class="setting-help" style="display: none; color: #f59e0b; margin-top: 5px; line-height: 1.4;">
+            ⚠️ Quick Tunnels do not support Server-Sent Events (SSE). Please uncheck "Stream" in settings, or use a Named Cloudflare Tunnel for streaming.
+          </div>
 
           <!-- Relay API Key (Session Storage Only) -->
           <div class="setting-group" style="margin-top: 10px; border-top: 1px solid var(--border-subtle); padding-top: 14px;">
@@ -987,6 +1148,7 @@ export function renderPlaygroundHtml(): string {
       isGenerating: false,
       abortController: null,
       autoScroll: true,
+      attachedImage: null,
       health: {
         status: 'checking',
         providerId: '',
@@ -1009,6 +1171,15 @@ export function renderPlaygroundHtml(): string {
       messagesList: document.getElementById('messages-list'),
       chatTextarea: document.getElementById('chat-textarea'),
       charTokenCounter: document.getElementById('char-token-counter'),
+      composerInputBox: document.getElementById('composer-input-box'),
+      attachImageBtn: document.getElementById('attach-image-btn'),
+      imageFileInput: document.getElementById('image-file-input'),
+      imagePreviewContainer: document.getElementById('image-preview-container'),
+      imagePreviewThumb: document.getElementById('image-preview-thumb'),
+      imagePreviewName: document.getElementById('image-preview-name'),
+      imagePreviewSize: document.getElementById('image-preview-size'),
+      removeImageBtn: document.getElementById('remove-image-btn'),
+      imageUnsupportedWarning: document.getElementById('image-unsupported-warning'),
       sendMessageBtn: document.getElementById('send-message-btn'),
       stopGenerationBtn: document.getElementById('stop-generation-btn'),
       clearChatBtn: document.getElementById('clear-chat-btn'),
@@ -1022,6 +1193,7 @@ export function renderPlaygroundHtml(): string {
       maxTokensVal: document.getElementById('max-tokens-val'),
       systemPromptInput: document.getElementById('system-prompt-input'),
       streamToggle: document.getElementById('stream-toggle'),
+      quickTunnelSseWarning: document.getElementById('quick-tunnel-sse-warning'),
       relayApiKeyInput: document.getElementById('relay-api-key-input'),
       resetSettingsBtn: document.getElementById('reset-settings-btn'),
       errorBanner: document.getElementById('error-banner'),
@@ -1345,6 +1517,107 @@ export function renderPlaygroundHtml(): string {
      * Reads the model's max_model_len backend/vLLM metadata extension from GET /v1/models if available.
      * Model-agnostic: supports any OpenAI-compatible/vLLM model.
      */
+    const SUPPORTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+    const MAX_IMAGE_FILE_SIZE_BYTES = 6 * 1024 * 1024; // 6 MB per-file limit
+    const MAX_REQUEST_PAYLOAD_BYTES = 9.5 * 1024 * 1024; // 9.5 MB request payload budget (under Fastify 10MB limit)
+    const DEFAULT_IMAGE_TOKEN_BUDGET = 576; // Default conservative fallback image tokens
+
+    function formatBytes(bytes) {
+      if (typeof bytes !== 'number' || isNaN(bytes)) return '0 B';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    /**
+     * Vision capability detection following strict precedence:
+     * 1. explicit capabilities.supportsVision
+     * 2. provider/model metadata (supportsVision)
+     * 3. architecture/model_type
+     * 4. model-id heuristic fallback (lowest priority)
+     */
+    function isModelVisionCapable(modelId) {
+      if (!modelId || !Array.isArray(state.models)) return { isCapable: false, source: 'no_model' };
+      const m = state.models.find(item => {
+        if (!item || !item.id) return false;
+        if (item.id === modelId) return true;
+        if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
+        if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
+        return false;
+      });
+
+      // 1. Explicit capabilities.supportsVision
+      if (m && m.capabilities && typeof m.capabilities.supportsVision === 'boolean') {
+        return { isCapable: m.capabilities.supportsVision, source: 'explicit_capabilities' };
+      }
+      // 2. Provider / model metadata
+      if (m && typeof m.supportsVision === 'boolean') {
+        return { isCapable: m.supportsVision, source: 'model_metadata' };
+      }
+      // 3. Architecture / model_type metadata
+      if (m && (m.model_type || m.architecture)) {
+        const combined = String(m.model_type || m.architecture).toLowerCase();
+        if (
+          combined.includes('vlm') ||
+          combined.includes('vision') ||
+          combined.includes('smolvlm') ||
+          combined.includes('idefics') ||
+          combined.includes('conditionalgeneration')
+        ) {
+          return { isCapable: true, source: 'architecture_metadata' };
+        }
+      }
+      // 4. Lowest-priority model-id heuristic fallback
+      const lower = String(modelId).toLowerCase();
+      const isHeuristic =
+        lower.includes('vlm') ||
+        lower.includes('vision') ||
+        lower.includes('-vl') ||
+        lower.includes('vl-') ||
+        lower.includes('ocr') ||
+        lower.includes('idefics') ||
+        lower.includes('llava') ||
+        lower.includes('pixtral') ||
+        lower.includes('paligemma') ||
+        lower.includes('florence') ||
+        lower.includes('smolvlm') ||
+        lower.includes('gemini');
+      if (isHeuristic) {
+        return { isCapable: true, source: 'model_id_heuristic_fallback' };
+      }
+      return { isCapable: false, source: 'default_text_only' };
+    }
+
+    /**
+     * Resolves image token budget per model following precedence:
+     * 1. explicit capabilities.imageTokens
+     * 2. model metadata image_tokens
+     * 3. conservative fallback (576 tokens)
+     */
+    function getModelImageTokenBudget(modelId) {
+      if (!modelId || !Array.isArray(state.models)) {
+        return { tokens: DEFAULT_IMAGE_TOKEN_BUDGET, source: 'default_conservative_fallback' };
+      }
+      const m = state.models.find(item => {
+        if (!item || !item.id) return false;
+        if (item.id === modelId) return true;
+        if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
+        if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
+        return false;
+      });
+      if (m && m.capabilities && typeof m.capabilities.imageTokens === 'number' && m.capabilities.imageTokens > 0) {
+        return { tokens: m.capabilities.imageTokens, source: 'capabilities.imageTokens' };
+      }
+      if (m && typeof m.image_tokens === 'number' && m.image_tokens > 0) {
+        return { tokens: m.image_tokens, source: 'model_metadata.image_tokens' };
+      }
+      return { tokens: DEFAULT_IMAGE_TOKEN_BUDGET, source: 'default_conservative_fallback' };
+    }
+
+    /**
+     * Reads the model's max_model_len backend/vLLM metadata extension from GET /v1/models if available.
+     * Model-agnostic: supports any OpenAI-compatible/vLLM model.
+     */
     function getModelMaxContextLength(modelId) {
       if (!modelId || !Array.isArray(state.models)) return null;
       const m = state.models.find(item => {
@@ -1363,20 +1636,33 @@ export function renderPlaygroundHtml(): string {
 
     /**
      * Conservative client-side token count estimation across message history.
-     * Note: This is an intentionally conservative heuristic (~3.5 chars/token + formatting overhead),
-     * not an exact BPE/sentencepiece tokenizer.
+     * Accurately accounts for text tokens, framing overhead, and multimodal image token budgets.
+     * NEVER counts base64 data-URI characters as text tokens.
      */
-    function estimateMessagesTokens(messages) {
+    function estimateMessagesTokens(messages, activeModelId) {
       if (!Array.isArray(messages)) return 0;
       let totalChars = 0;
+      let totalImageTokens = 0;
+      let imageTokenSource = 'none';
+
+      const budget = getModelImageTokenBudget(activeModelId || state.activeModel);
+
       for (const msg of messages) {
         if (!msg) continue;
         if (typeof msg.content === 'string') {
           totalChars += msg.content.length;
         } else if (Array.isArray(msg.content)) {
           for (const part of msg.content) {
-            if (part && typeof part.text === 'string') totalChars += part.text.length;
-            else if (typeof part === 'string') totalChars += part;
+            if (!part) continue;
+            if (typeof part.text === 'string') {
+              totalChars += part.text.length;
+            } else if (typeof part === 'string') {
+              totalChars += part.length;
+            } else if (part.type === 'image_url' || part.image_url) {
+              // Multimodal image part: allocate image token budget, NEVER count base64 characters!
+              totalImageTokens += budget.tokens;
+              imageTokenSource = budget.source;
+            }
           }
         } else if (msg.content) {
           try {
@@ -1386,9 +1672,30 @@ export function renderPlaygroundHtml(): string {
           }
         }
       }
+
       const textTokens = Math.ceil(totalChars / 3.5);
       const framingOverhead = messages.length * 4 + 3;
-      return textTokens + framingOverhead;
+      const totalTokens = textTokens + totalImageTokens + framingOverhead;
+
+      // Attach detailed metadata to returned number for diagnostics/tests
+      const result = Number(totalTokens);
+      Object.defineProperties(result, {
+        totalTokens: { value: totalTokens, enumerable: true },
+        textTokens: { value: textTokens, enumerable: true },
+        totalImageTokens: { value: totalImageTokens, enumerable: true },
+        imageTokenSource: { value: imageTokenSource, enumerable: true },
+        framingOverhead: { value: framingOverhead, enumerable: true },
+      });
+      return result;
+    }
+
+    function calculateRequestPayloadSize(payload) {
+      try {
+        const serialized = JSON.stringify(payload);
+        return new TextEncoder().encode(serialized).length;
+      } catch {
+        return 0;
+      }
     }
 
     /**
@@ -1407,7 +1714,8 @@ export function renderPlaygroundHtml(): string {
         return { effectiveMaxTokens: userMax, availableBudget: null, maxModelLen: null };
       }
 
-      const estimatedInputTokens = estimateMessagesTokens(messages);
+      const tokenEstimate = estimateMessagesTokens(messages, modelId);
+      const estimatedInputTokens = typeof tokenEstimate === 'number' ? tokenEstimate : (tokenEstimate.totalTokens || 0);
       const availableBudget = maxModelLen - estimatedInputTokens;
 
       if (availableBudget <= 0) {
@@ -1421,6 +1729,7 @@ export function renderPlaygroundHtml(): string {
           estimatedInputTokens,
           availableBudget,
           maxModelLen,
+          tokenDetails: tokenEstimate,
         };
       }
 
@@ -1430,7 +1739,30 @@ export function renderPlaygroundHtml(): string {
         estimatedInputTokens,
         availableBudget,
         maxModelLen,
+        tokenDetails: tokenEstimate,
       };
+    }
+
+    function updateAttachmentSupport() {
+      const visionStatus = isModelVisionCapable(state.activeModel);
+      if (elements.attachImageBtn) {
+        elements.attachImageBtn.disabled = !visionStatus.isCapable;
+        if (!visionStatus.isCapable) {
+          elements.attachImageBtn.title =
+            'Model ' + (state.activeModel || '') + ' does not support image input';
+        } else {
+          elements.attachImageBtn.title = 'Attach image (PNG, JPEG, WebP)';
+        }
+      }
+      if (state.attachedImage && !visionStatus.isCapable) {
+        if (elements.imageUnsupportedWarning) {
+          elements.imageUnsupportedWarning.style.display = 'flex';
+        }
+      } else {
+        if (elements.imageUnsupportedWarning) {
+          elements.imageUnsupportedWarning.style.display = 'none';
+        }
+      }
     }
 
     function updateActiveModelInfo() {
@@ -1448,13 +1780,127 @@ export function renderPlaygroundHtml(): string {
       } else {
         elements.maxTokensInput.max = '8192';
       }
+
+      updateAttachmentSupport();
+
+      // Quick Tunnel SSE warning (only when model is served via Quick Tunnel)
+      const isQuick = Boolean(active && (active.is_quick_tunnel || (typeof active.owned_by === 'string' && active.owned_by.includes('trycloudflare'))));
+      if (elements.quickTunnelSseWarning) {
+        elements.quickTunnelSseWarning.style.display = isQuick ? 'block' : 'none';
+      }
+    }
+
+    function handleSelectedImageFile(file) {
+      if (!file) return;
+
+      showError('');
+
+      // 1. Model vision capability check
+      const visionStatus = isModelVisionCapable(state.activeModel);
+      if (!visionStatus.isCapable) {
+        showError(
+          'Model "' +
+            (state.activeModel || 'selected') +
+            '" does not support image input. Please select a multimodal model (e.g., SmolVLM2 or Gemini).'
+        );
+        clearAttachedImage();
+        return;
+      }
+
+      // 2. Strict MIME type check (PNG, JPEG, WebP)
+      if (!SUPPORTED_IMAGE_TYPES.includes(file.type)) {
+        showError(
+          'Unsupported file type (' +
+            (file.type || 'unknown') +
+            '). Please select a PNG, JPEG, or WebP image.'
+        );
+        clearAttachedImage();
+        return;
+      }
+
+      // 3. File size limit check (6 MB)
+      if (file.size > MAX_IMAGE_FILE_SIZE_BYTES) {
+        showError(
+          'Image size (' +
+            formatBytes(file.size) +
+            ') exceeds the maximum limit of ' +
+            formatBytes(MAX_IMAGE_FILE_SIZE_BYTES) +
+            '. Please choose a smaller image.'
+        );
+        clearAttachedImage();
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUri = reader.result;
+        if (typeof dataUri !== 'string' || !dataUri.startsWith('data:image/')) {
+          showError('Failed to read image as valid data URI.');
+          clearAttachedImage();
+          return;
+        }
+
+        state.attachedImage = {
+          file,
+          dataUri,
+          name: file.name || 'image',
+          size: file.size,
+          type: file.type,
+        };
+
+        elements.imagePreviewThumb.src = dataUri;
+        elements.imagePreviewName.textContent = file.name || 'image';
+        elements.imagePreviewSize.textContent = formatBytes(file.size);
+        elements.imagePreviewContainer.style.display = 'flex';
+        updateAttachmentSupport();
+        autoResizeTextarea();
+      };
+      reader.onerror = () => {
+        showError('Error reading selected image file.');
+        clearAttachedImage();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function clearAttachedImage() {
+      state.attachedImage = null;
+      if (elements.imageFileInput) elements.imageFileInput.value = '';
+      if (elements.imagePreviewContainer) elements.imagePreviewContainer.style.display = 'none';
+      if (elements.imagePreviewThumb) elements.imagePreviewThumb.src = '';
+      if (elements.imagePreviewName) elements.imagePreviewName.textContent = '';
+      if (elements.imagePreviewSize) elements.imagePreviewSize.textContent = '';
+      if (elements.imageUnsupportedWarning) elements.imageUnsupportedWarning.style.display = 'none';
+      updateAttachmentSupport();
+      autoResizeTextarea();
+    }
+
+    function sanitizeMessageForStorage(msg) {
+      if (!msg) return null;
+      const copy = { ...msg };
+      delete copy.imageUrl; // NEVER store full base64 data URI in localStorage!
+
+      if (Array.isArray(copy.content)) {
+        let extractedText = '';
+        let hasImage = false;
+        for (const p of copy.content) {
+          if (p && p.type === 'text') extractedText = p.text || '';
+          if (p && (p.type === 'image_url' || p.image_url)) hasImage = true;
+        }
+        copy.content = extractedText;
+        if (hasImage) {
+          copy.hasImage = true;
+          copy.imagePlaceholder = copy.imageName || 'Attached image';
+        }
+      }
+      return copy;
     }
 
     // Conversation State & UI Rendering
     function saveConversation() {
       try {
         const bounded = state.messages.length > 100 ? state.messages.slice(-100) : state.messages;
-        localStorage.setItem(STORAGE_CHAT_KEY, JSON.stringify(bounded));
+        const sanitized = bounded.map(sanitizeMessageForStorage).filter(Boolean);
+        localStorage.setItem(STORAGE_CHAT_KEY, JSON.stringify(sanitized));
       } catch {
         // Ignore quota
       }
@@ -1563,10 +2009,36 @@ export function renderPlaygroundHtml(): string {
           bubble.appendChild(cursor);
         }
       } else {
-        // User messages are safe text paragraphs
-        const p = document.createElement('p');
-        p.textContent = msg.content;
-        bubble.appendChild(p);
+        // User messages
+        if (msg.imageUrl) {
+          const imgContainer = document.createElement('div');
+          imgContainer.className = 'message-image-container';
+          const img = document.createElement('img');
+          img.src = msg.imageUrl;
+          img.alt = msg.imageName || 'Attached image';
+          img.className = 'message-image-preview';
+          imgContainer.appendChild(img);
+          bubble.appendChild(imgContainer);
+        } else if (msg.hasImage || msg.imagePlaceholder) {
+          const ph = document.createElement('div');
+          ph.className = 'message-image-placeholder';
+          ph.textContent = '🖼️ [' + (msg.imagePlaceholder || msg.imageName || 'Attached image') + ']';
+          bubble.appendChild(ph);
+        }
+
+        let userText = '';
+        if (typeof msg.content === 'string') {
+          userText = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          for (const p of msg.content) {
+            if (p && p.type === 'text') userText = p.text || '';
+          }
+        }
+        if (userText) {
+          const p = document.createElement('p');
+          p.textContent = userText;
+          bubble.appendChild(p);
+        }
       }
 
       // Actions
@@ -1706,8 +2178,17 @@ export function renderPlaygroundHtml(): string {
 
       const text = elements.chatTextarea.value;
       const chars = text.length;
-      const estimatedTokens = Math.ceil(chars / 4);
-      elements.charTokenCounter.textContent = estimatedTokens + ' tokens • ' + chars + ' chars';
+      let estimatedTokens = Math.ceil(chars / 4);
+      if (state.attachedImage) {
+        const imageBudget = getModelImageTokenBudget(state.activeModel);
+        estimatedTokens += imageBudget.tokens;
+      }
+      elements.charTokenCounter.textContent =
+        estimatedTokens +
+        ' tokens • ' +
+        chars +
+        ' chars' +
+        (state.attachedImage ? ' + 1 image' : '');
     }
 
     elements.chatTextarea.addEventListener('input', autoResizeTextarea);
@@ -1730,15 +2211,125 @@ export function renderPlaygroundHtml(): string {
       }
     });
 
+    // Image Attachment & Drag-Drop Event Listeners
+    if (elements.attachImageBtn) {
+      elements.attachImageBtn.onclick = () => {
+        const visionStatus = isModelVisionCapable(state.activeModel);
+        if (!visionStatus.isCapable) {
+          showError(
+            'Model "' +
+              (state.activeModel || 'selected') +
+              '" does not support image input. Please select a multimodal model (e.g., SmolVLM2 or Gemini).'
+          );
+          return;
+        }
+        elements.imageFileInput.click();
+      };
+    }
+
+    if (elements.imageFileInput) {
+      elements.imageFileInput.onchange = (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) {
+          handleSelectedImageFile(file);
+        }
+      };
+    }
+
+    if (elements.removeImageBtn) {
+      elements.removeImageBtn.onclick = () => {
+        clearAttachedImage();
+      };
+    }
+
+    if (elements.composerInputBox) {
+      elements.composerInputBox.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        elements.composerInputBox.classList.add('drag-over');
+      });
+
+      elements.composerInputBox.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        elements.composerInputBox.classList.remove('drag-over');
+      });
+
+      elements.composerInputBox.addEventListener('drop', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        elements.composerInputBox.classList.remove('drag-over');
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          const file = e.dataTransfer.files[0];
+          handleSelectedImageFile(file);
+        }
+      });
+    }
+
+    elements.chatTextarea.addEventListener('paste', (e) => {
+      if (e.clipboardData && e.clipboardData.items) {
+        for (let i = 0; i < e.clipboardData.items.length; i++) {
+          const item = e.clipboardData.items[i];
+          if (item.type && item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (file) {
+              e.preventDefault();
+              handleSelectedImageFile(file);
+              break;
+            }
+          }
+        }
+      }
+    });
+
     // Send Message / SSE Streaming Execution
     async function sendMessage() {
       const content = elements.chatTextarea.value.trim();
-      if (!content || state.isGenerating) return;
+      const hasAttachment = Boolean(state.attachedImage);
+
+      if ((!content && !hasAttachment) || state.isGenerating) return;
 
       showError('');
       if (!state.activeModel) {
         showError('No model selected or available on Relay gateway.');
         return;
+      }
+
+      // Vision capability check if image attached
+      if (hasAttachment) {
+        const visionStatus = isModelVisionCapable(state.activeModel);
+        if (!visionStatus.isCapable) {
+          showError(
+            'Model "' +
+              state.activeModel +
+              '" does not support image attachments. Please remove the image or select a multimodal model (e.g., SmolVLM2 or Gemini).'
+          );
+          return;
+        }
+      }
+
+      // Build user candidate message content
+      let userCandidateContent;
+      let userRuntimeImageUrl = null;
+      let userImageName = null;
+
+      if (hasAttachment) {
+        userRuntimeImageUrl = state.attachedImage.dataUri;
+        userImageName = state.attachedImage.name;
+        userCandidateContent = [
+          {
+            type: 'image_url',
+            image_url: {
+              url: state.attachedImage.dataUri,
+            },
+          },
+          {
+            type: 'text',
+            text: content,
+          },
+        ];
+      } else {
+        userCandidateContent = content;
       }
 
       // Build candidate API messages to evaluate context budget
@@ -1749,7 +2340,7 @@ export function renderPlaygroundHtml(): string {
       for (const m of state.messages) {
         candidateMessages.push({ role: m.role, content: m.content });
       }
-      candidateMessages.push({ role: 'user', content });
+      candidateMessages.push({ role: 'user', content: userCandidateContent });
 
       // Authoritative request-time context budget calculation
       const budgetResult = calculateEffectiveMaxTokens(
@@ -1763,16 +2354,41 @@ export function renderPlaygroundHtml(): string {
         return;
       }
 
+      const payload = {
+        model: state.activeModel,
+        messages: candidateMessages,
+        temperature: state.temperature,
+        max_tokens: budgetResult.effectiveMaxTokens,
+        stream: state.stream,
+      };
+
+      // Request-body serialized size verification
+      const serializedSize = calculateRequestPayloadSize(payload);
+      if (serializedSize > MAX_REQUEST_PAYLOAD_BYTES) {
+        showError(
+          'Total request payload size (' +
+            formatBytes(serializedSize) +
+            ') exceeds the maximum allowable request budget (' +
+            formatBytes(MAX_REQUEST_PAYLOAD_BYTES) +
+            '). Please choose a smaller image or clear conversation history.'
+        );
+        return;
+      }
+
       // Add user message
       state.messages.push({
         role: 'user',
-        content,
+        content: userCandidateContent,
+        imageUrl: userRuntimeImageUrl,
+        imageName: userImageName,
+        hasImage: hasAttachment,
         timestamp: Date.now(),
       });
 
       // Clear composer
       elements.chatTextarea.value = '';
       autoResizeTextarea();
+      clearAttachedImage();
 
       // Create empty assistant slot
       const assistantIndex = state.messages.length;
@@ -1786,14 +2402,6 @@ export function renderPlaygroundHtml(): string {
 
       renderConversation();
       setGeneratingState(true);
-
-      const payload = {
-        model: state.activeModel,
-        messages: candidateMessages,
-        temperature: state.temperature,
-        max_tokens: budgetResult.effectiveMaxTokens,
-        stream: state.stream,
-      };
 
       state.abortController = new AbortController();
 
@@ -1942,6 +2550,7 @@ export function renderPlaygroundHtml(): string {
     function clearChat() {
       if (state.isGenerating) return;
       state.messages = [];
+      clearAttachedImage();
       localStorage.removeItem(STORAGE_CHAT_KEY);
       renderConversation();
       showError('');

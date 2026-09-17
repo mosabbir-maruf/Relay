@@ -140,6 +140,10 @@ export const EnvironmentSchema = z.object({
     z.string().default('openai-compatible'),
   ),
   OPENAI_COMPATIBLE_MODELS: optionalTrimmedString,
+  OPENAI_COMPATIBLE_SUPPORTS_VISION: z.preprocess(
+    (val) => (val === undefined ? undefined : val === 'true' || val === true || val === '1'),
+    z.boolean().optional(),
+  ),
 
   // Generic vLLM (OpenAI-Compatible) Configuration
   VLLM_BASE_URL: optionalHttpUrlString,
@@ -147,6 +151,10 @@ export const EnvironmentSchema = z.object({
   VLLM_MODEL: optionalTrimmedString,
   VLLM_MODELS: optionalTrimmedString,
   VLLM_MAX_MODEL_LEN: z.coerce.number().int().positive().optional(),
+  VLLM_SUPPORTS_VISION: z.preprocess(
+    (val) => (val === undefined ? undefined : val === 'true' || val === true || val === '1'),
+    z.boolean().optional(),
+  ),
 
   // Legacy Qwen (vLLM OpenAI-Compatible) Configuration (backward compatibility)
   QWEN_BASE_URL: optionalHttpUrlString,
@@ -204,6 +212,61 @@ export interface RelayConfig {
   readonly defaultModels: readonly ModelInfo[];
   readonly openAiCompatibleBackends: readonly OpenAiCompatibleBackendConfig[];
   readonly routingPolicies: readonly ModelRoutingRule[];
+}
+
+/**
+ * Model-ID heuristic fallback for detecting multimodal/vision models.
+ * Note: Strictly a lowest-priority fallback heuristic; never authoritative over explicit capabilities.
+ */
+export function isMultimodalModelId(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return (
+    lower.includes('vlm') ||
+    lower.includes('vision') ||
+    lower.includes('-vl') ||
+    lower.includes('vl-') ||
+    lower.includes('ocr') ||
+    lower.includes('idefics') ||
+    lower.includes('llava') ||
+    lower.includes('pixtral') ||
+    lower.includes('paligemma') ||
+    lower.includes('florence') ||
+    lower.includes('smolvlm') ||
+    lower.includes('gemini')
+  );
+}
+
+export function resolveModelVisionCapability(
+  modelId: string,
+  explicitCapability?: boolean,
+  metadata?: { supportsVision?: boolean; architecture?: string; model_type?: string },
+): { supportsVision: boolean; source: string } {
+  // 1. Explicit capabilities.supportsVision
+  if (typeof explicitCapability === 'boolean') {
+    return { supportsVision: explicitCapability, source: 'explicit_capability' };
+  }
+  // 2. Provider / model metadata
+  if (typeof metadata?.supportsVision === 'boolean') {
+    return { supportsVision: metadata.supportsVision, source: 'model_metadata' };
+  }
+  // 3. Architecture / model type
+  if (metadata?.architecture || metadata?.model_type) {
+    const combined = `${metadata.architecture ?? ''} ${metadata.model_type ?? ''}`.toLowerCase();
+    if (
+      combined.includes('vlm') ||
+      combined.includes('vision') ||
+      combined.includes('smolvlm') ||
+      combined.includes('idefics') ||
+      combined.includes('conditionalgeneration')
+    ) {
+      return { supportsVision: true, source: 'architecture_metadata' };
+    }
+  }
+  // 4. Lowest-priority model-id heuristic fallback
+  if (isMultimodalModelId(modelId)) {
+    return { supportsVision: true, source: 'model_id_heuristic_fallback' };
+  }
+  return { supportsVision: false, source: 'default_text_only' };
 }
 
 /**
@@ -398,6 +461,13 @@ export function loadConfig(
     for (const modelId of backend.models) {
       const isVllm = backend.id === 'vllm';
       const maxContextTokens = isVllm && env.VLLM_MAX_MODEL_LEN ? env.VLLM_MAX_MODEL_LEN : 32768;
+      const explicitVision =
+        isVllm && env.VLLM_SUPPORTS_VISION !== undefined
+          ? env.VLLM_SUPPORTS_VISION
+          : env.OPENAI_COMPATIBLE_SUPPORTS_VISION !== undefined
+            ? env.OPENAI_COMPATIBLE_SUPPORTS_VISION
+            : undefined;
+      const visionResult = resolveModelVisionCapability(modelId, explicitVision);
       defaultModels.push({
         id: modelId,
         name: modelId,
@@ -405,7 +475,7 @@ export function loadConfig(
         capabilities: {
           supportsStreaming: true,
           supportsToolCalling: true,
-          supportsVision: false,
+          supportsVision: visionResult.supportsVision,
           supportsStructuredOutput: true,
           maxContextTokens,
           maxOutputTokens: 4096,
