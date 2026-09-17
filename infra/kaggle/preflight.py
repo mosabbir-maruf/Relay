@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,19 +24,25 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-# Safe hardware defaults for Kaggle dual NVIDIA Tesla T4
-DEFAULT_TENSOR_PARALLEL_SIZE = 2
-DEFAULT_MAX_MODEL_LEN = 4096
-DEFAULT_MAX_NUM_SEQS = 4
-DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
-DEFAULT_DTYPE = "float16"
-DEFAULT_ENFORCE_EAGER = True
+# Safe reference hardware profile for Kaggle dual NVIDIA Tesla T4
+REFERENCE_PER_GPU_VRAM_GB = 14.75
+REFERENCE_TOTAL_VRAM_GB = 29.50
+DUAL_T4_TOTAL_VRAM_GB = 29.50
+DUAL_T4_PER_GPU_VRAM_GB = 14.75
+
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "0.0.0.0"
 
-# Dual Tesla T4 hardware parameters: 2x 16 GB (~15,109 MiB usable each) = ~30 GB total
-DUAL_T4_TOTAL_VRAM_GB = 29.5
-DUAL_T4_PER_GPU_VRAM_GB = 14.75
+# Deployment policy bounds for GPU memory utilization
+POLICY_UTILIZATION_MIN = 0.70
+POLICY_UTILIZATION_MAX = 0.92
+
+# Architecture-specific minimum vLLM version requirements (only known requirements)
+KNOWN_ARCHITECTURE_MIN_VLLM_VERSIONS: Dict[str, str] = {
+    "glmocrforconditionalgeneration": "0.16.0",
+    "qwen2vlforconditionalgeneration": "0.20.0",
+    "qwen2_5_vlforconditionalgeneration": "0.25.0",
+}
 
 # Unsupported non-causal LM architectures
 UNSUPPORTED_ARCH_PATTERNS = [
@@ -97,6 +104,88 @@ SUPPORTED_MULTIMODAL_MODEL_TYPES = {
 }
 
 
+def parse_semver(ver_str: str) -> Tuple[int, ...]:
+    """Parses semantic version string into integer tuple for comparison."""
+    parts = []
+    for p in re.split(r"[^\d]+", ver_str):
+        if p.isdigit():
+            parts.append(int(p))
+    return tuple(parts) if parts else (0,)
+
+
+def detect_installed_vllm_version() -> Optional[str]:
+    """Detects installed vLLM version via import or CLI. Does not assume presence."""
+    try:
+        import vllm
+
+        ver = getattr(vllm, "__version__", None)
+        if ver:
+            return str(ver)
+    except Exception:
+        pass
+
+    if shutil.which("vllm"):
+        try:
+            res = subprocess.check_output(
+                ["vllm", "--version"], stderr=subprocess.DEVNULL, text=True
+            )
+            m = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", res)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+    return None
+
+
+def check_vllm_version_compatibility(
+    architectures: List[str], installed_ver: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Checks architecture compatibility against known minimum vLLM versions.
+    If architecture has no known minimum in the registry, reports UNKNOWN and requires runtime validation.
+    """
+    res: Dict[str, Any] = {
+        "installed_version": installed_ver or "NOT_INSTALLED",
+        "required_version": "UNKNOWN",
+        "status": "UNKNOWN_REQUIRES_RUNTIME_CHECK",
+        "compatible": True,
+        "warning": None,
+    }
+
+    if not architectures:
+        return res
+
+    for arch in architectures:
+        arch_clean = re.sub(r"[^a-zA-Z0-9]", "", arch).lower()
+        for req_arch, min_ver in KNOWN_ARCHITECTURE_MIN_VLLM_VERSIONS.items():
+            if req_arch in arch_clean:
+                res["required_version"] = min_ver
+                if installed_ver and installed_ver != "NOT_INSTALLED":
+                    if parse_semver(installed_ver) < parse_semver(min_ver):
+                        res["compatible"] = False
+                        res["status"] = "INCOMPATIBLE"
+                        res["warning"] = (
+                            f"Architecture '{arch}' requires vLLM >= {min_ver}, but installed "
+                            f"version is {installed_ver}."
+                        )
+                    else:
+                        res["status"] = "COMPATIBLE"
+                else:
+                    res["status"] = "UNVERIFIED_NOT_INSTALLED"
+                    res["warning"] = (
+                        f"Architecture '{arch}' requires vLLM >= {min_ver}. Ensure vLLM >= {min_ver} "
+                        "is installed in the runtime environment."
+                    )
+                return res
+
+    res["warning"] = (
+        "Minimum vLLM version requirement is UNKNOWN for this architecture. "
+        "Runtime compatibility validation is required during server startup."
+    )
+    return res
+
+
 def classify_model_capabilities(
     architectures: List[str],
     model_type: str,
@@ -155,7 +244,6 @@ def classify_model_capabilities(
     return "unsupported", []
 
 
-
 def mask_token(token: Optional[str]) -> str:
     """Masks authentication token for safe logging."""
     if not token:
@@ -174,13 +262,19 @@ def sanitize_served_name(model_id: str) -> str:
 
 
 def detect_gpus() -> Dict[str, Any]:
-    """Detects available NVIDIA GPUs via nvidia-smi."""
+    """
+    Detects available NVIDIA GPUs via nvidia-smi.
+    Does NOT fake hardware in dry-run/local mode.
+    """
     info: Dict[str, Any] = {
+        "status": "UNKNOWN_NO_GPU",
         "available": False,
         "count": 0,
         "devices": [],
         "total_vram_gb": 0.0,
+        "per_gpu_vram_gb": 0.0,
         "is_tesla_t4": False,
+        "compute_capability": "Unknown",
     }
 
     if not shutil.which("nvidia-smi"):
@@ -194,7 +288,11 @@ def detect_gpus() -> Dict[str, Any]:
         ]
         res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
         lines = [line.strip() for line in res.strip().splitlines() if line.strip()]
-        info["available"] = len(lines) > 0
+        if not lines:
+            return info
+
+        info["status"] = "DETECTED"
+        info["available"] = True
         info["count"] = len(lines)
 
         total_mb = 0.0
@@ -207,8 +305,12 @@ def detect_gpus() -> Dict[str, Any]:
             info["devices"].append({"index": idx, "name": name, "memory_mb": mem_mb})
             if "T4" in name.upper():
                 info["is_tesla_t4"] = True
+                info["compute_capability"] = "7.5"
 
         info["total_vram_gb"] = round(total_mb / 1024.0, 2)
+        info["per_gpu_vram_gb"] = (
+            round((total_mb / len(lines)) / 1024.0, 2) if lines else 0.0
+        )
     except Exception:
         pass
 
@@ -260,17 +362,107 @@ def fetch_hf_model_metadata(
 
     # 2. Fetch config.json if not present or incomplete in model_info
     config = model_info.get("config")
-    if not isinstance(config, dict) or not config.get("architectures"):
+    has_full_config = (
+        isinstance(config, dict)
+        and config.get("architectures")
+        and (
+            config.get("max_position_embeddings")
+            or config.get("n_positions")
+            or config.get("n_ctx")
+            or config.get("hidden_size")
+            or config.get("n_embd")
+        )
+    )
+    if not has_full_config:
         config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
         cfg_req = urllib.request.Request(config_url, headers=headers)
         try:
             with urllib.request.urlopen(cfg_req, timeout=12) as cfg_resp:
-                config = json.loads(cfg_resp.read().decode("utf-8"))
+                raw_cfg = json.loads(cfg_resp.read().decode("utf-8"))
+                if isinstance(raw_cfg, dict):
+                    merged = dict(raw_cfg)
+                    if isinstance(config, dict):
+                        # Merge with config, but don't let empty/stub overwrite full config
+                        for k, v in config.items():
+                            if v is not None:
+                                merged[k] = v
+                    config = merged
         except Exception:
             if not isinstance(config, dict):
                 config = {}
 
     return model_info, config
+
+
+def extract_attention_dimensions(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extracts attention dimensions needed for formulaic KV cache estimation.
+    Checks top-level config and nested text_config (common in vision-language models).
+    """
+    res: Dict[str, Any] = {
+        "num_hidden_layers": None,
+        "num_attention_heads": None,
+        "num_key_value_heads": None,
+        "hidden_size": None,
+        "head_dim": None,
+        "source": "unknown",
+    }
+
+    def _lookup(cfg: Dict[str, Any], keys: List[str]) -> Optional[int]:
+        for k in keys:
+            v = cfg.get(k)
+            if v is not None and str(v).isdigit():
+                return int(v)
+        return None
+
+    target_cfg = config if isinstance(config, dict) else {}
+    text_cfg = (
+        target_cfg.get("text_config")
+        if isinstance(target_cfg.get("text_config"), dict)
+        else {}
+    )
+
+    layers = _lookup(
+        target_cfg, ["num_hidden_layers", "n_layer", "num_layers", "n_layers"]
+    )
+    if layers is None:
+        layers = _lookup(
+            text_cfg, ["num_hidden_layers", "n_layer", "num_layers", "n_layers"]
+        )
+    res["num_hidden_layers"] = layers
+
+    heads = _lookup(target_cfg, ["num_attention_heads", "n_head", "num_heads"])
+    if heads is None:
+        heads = _lookup(text_cfg, ["num_attention_heads", "n_head", "num_heads"])
+    res["num_attention_heads"] = heads
+
+    kv_heads = _lookup(
+        target_cfg, ["num_key_value_heads", "num_kv_heads", "n_head_kv"]
+    )
+    if kv_heads is None:
+        kv_heads = _lookup(
+            text_cfg, ["num_key_value_heads", "num_kv_heads", "n_head_kv"]
+        )
+    if kv_heads is None and heads is not None:
+        kv_heads = heads
+    res["num_key_value_heads"] = kv_heads
+
+    h_size = _lookup(target_cfg, ["hidden_size", "n_embd", "d_model"])
+    if h_size is None:
+        h_size = _lookup(text_cfg, ["hidden_size", "n_embd", "d_model"])
+    res["hidden_size"] = h_size
+
+    h_dim = _lookup(target_cfg, ["head_dim"])
+    if h_dim is None:
+        h_dim = _lookup(text_cfg, ["head_dim"])
+    if h_dim is None and h_size is not None and heads is not None and heads > 0:
+        h_dim = h_size // heads
+    res["head_dim"] = h_dim
+
+    if res["num_hidden_layers"] and res["num_key_value_heads"] and res["head_dim"]:
+        res["source"] = "hf_config"
+
+    return res
 
 
 def inspect_model_attributes(
@@ -300,6 +492,7 @@ def inspect_model_attributes(
         or config.get("seq_length")
         or config.get("max_sequence_length")
         or config.get("n_positions")
+        or config.get("n_ctx")
     )
     if not ctx and isinstance(config.get("text_config"), dict):
         text_cfg = config["text_config"]
@@ -308,14 +501,20 @@ def inspect_model_attributes(
             or text_cfg.get("seq_length")
             or text_cfg.get("max_sequence_length")
             or text_cfg.get("n_positions")
+            or text_cfg.get("n_ctx")
         )
     attrs["context_length"] = int(ctx) if ctx and str(ctx).isdigit() else None
+    attrs["native_context_length"] = attrs["context_length"]
 
     # Native torch dtype
     torch_dtype = config.get("torch_dtype")
     if not torch_dtype and isinstance(config.get("text_config"), dict):
         torch_dtype = config["text_config"].get("dtype")
     attrs["torch_dtype"] = torch_dtype
+
+    # Attention dimensions for KV cache calculations
+    attrs["attention_dimensions"] = extract_attention_dimensions(config)
+    attrs["vision_config"] = config.get("vision_config")
 
     # Quantization detection
     quant_cfg = config.get("quantization_config") or {}
@@ -374,6 +573,575 @@ def inspect_model_attributes(
     return attrs
 
 
+def estimate_memory_components(
+    attrs: Dict[str, Any],
+    serving_context: int,
+    max_num_seqs: int = 1,
+) -> Dict[str, Any]:
+    """
+    Estimates memory components with explicit source, confidence, and warnings.
+    Returns:
+      weights: {value, unit, source, confidence, warning}
+      visual: {value, unit, source, confidence, warning}
+      kv_cache: {value, unit, source, confidence, warning}
+      cuda_runtime: {value, unit, source, confidence, warning}
+      total_estimated_single_gpu_workload_gb: float
+    """
+    param_count = attrs.get("param_count")
+    quant_method = attrs.get("quantization_method")
+    model_kind = attrs.get("model_kind", "text_causal_lm")
+    attn_dim = attrs.get("attention_dimensions") or {}
+
+    # 1. Weights
+    if param_count and param_count > 0:
+        if quant_method in ("awq", "gptq"):
+            b_per_param = 0.6  # 4-bit + packing overhead
+            w_source = f"hf_metadata_{quant_method}_4bit"
+        elif quant_method in ("int8", "bitsandbytes"):
+            b_per_param = 1.0  # 8-bit
+            w_source = f"hf_metadata_{quant_method}_8bit"
+        elif quant_method == "fp8":
+            b_per_param = 1.0
+            w_source = "hf_metadata_fp8"
+        else:
+            b_per_param = 2.0  # 16-bit
+            w_source = "hf_metadata_16bit"
+
+        w_bytes = param_count * b_per_param
+        w_val = round(w_bytes / 1e9, 2)
+        w_conf = "high"
+        w_warn = None
+    else:
+        w_val = 14.0  # Safe candidate estimate (~7B 16-bit)
+        w_source = "heuristic_fallback"
+        w_conf = "heuristic"
+        w_warn = (
+            "Model parameter count is unknown; estimated weight footprint at 14.0 GB "
+            "(typical 7B 16-bit)."
+        )
+
+    weights_comp = {
+        "value": w_val,
+        "unit": "GB",
+        "source": w_source,
+        "confidence": w_conf,
+        "warning": w_warn,
+    }
+
+    # 2. Visual Encoder Overhead
+    if model_kind == "multimodal_causal_lm":
+        vision_cfg = attrs.get("vision_config")
+        if isinstance(vision_cfg, dict) and vision_cfg.get("num_parameters"):
+            v_params = int(vision_cfg["num_parameters"])
+            v_val = round((v_params * 2.0) / 1e9, 2)
+            v_source = "derived_from_vision_config"
+            v_conf = "medium"
+            v_warn = None
+        else:
+            v_val = 1.0
+            v_source = "heuristic_estimate"
+            v_conf = "heuristic"
+            v_warn = (
+                "Visual encoder memory is an estimated heuristic (~1.0 GB); actual allocation "
+                "depends on vision resolution and tower parameters."
+            )
+    else:
+        v_val = 0.0
+        v_source = "not_applicable"
+        v_conf = "high"
+        v_warn = None
+
+    visual_comp = {
+        "value": v_val,
+        "unit": "GB",
+        "source": v_source,
+        "confidence": v_conf,
+        "warning": v_warn,
+    }
+
+    # 3. KV Cache
+    n_layers = attn_dim.get("num_hidden_layers")
+    n_kv = attn_dim.get("num_key_value_heads")
+    d_h = attn_dim.get("head_dim")
+
+    if n_layers and n_kv and d_h:
+        # Formula: 2 (K + V) * layers * kv_heads * head_dim * 2 (float16 bytes) * context * seqs
+        kv_bytes = 2 * n_layers * n_kv * d_h * 2 * serving_context * max_num_seqs
+        kv_val = round(kv_bytes / (1024**3), 2)
+        if kv_val < 0.01:
+            kv_val = 0.01
+        kv_source = "calculated_from_architecture"
+        kv_conf = "high"
+        kv_warn = None
+    else:
+        kv_val = round(1.5 * (serving_context / 4096.0) * max_num_seqs, 2)
+        if kv_val < 0.2:
+            kv_val = 0.2
+        kv_source = "heuristic_estimate"
+        kv_conf = "heuristic"
+        kv_warn = (
+            "KV cache memory estimated via heuristic due to incomplete attention "
+            "dimensions in config."
+        )
+
+    kv_comp = {
+        "value": kv_val,
+        "unit": "GB",
+        "source": kv_source,
+        "confidence": kv_conf,
+        "warning": kv_warn,
+    }
+
+    # 4. CUDA & Runtime Overhead
+    cuda_comp = {
+        "value": 1.0,
+        "unit": "GB",
+        "source": "fixed_runtime_headroom",
+        "confidence": "high",
+        "warning": None,
+    }
+
+    total_single = round(w_val + v_val + kv_val + cuda_comp["value"], 2)
+
+    return {
+        "weights": weights_comp,
+        "visual": visual_comp,
+        "kv_cache": kv_comp,
+        "cuda_runtime": cuda_comp,
+        "total_estimated_single_gpu_workload_gb": total_single,
+    }
+
+
+def recommend_configuration(
+    attrs: Dict[str, Any],
+    gpu_info: Dict[str, Any],
+    user_overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Executes the strict 7-stage candidate recommendation pipeline:
+      Stage 1: Model facts discovery (in attrs)
+      Stage 2: Candidate serving context selection
+      Stage 3: Memory footprint estimation
+      Stage 4: Candidate TP evaluation & fit check
+      Stage 5: Utilization calculation vs deployment policy bounds
+      Stage 6: vLLM version compatibility check
+      Stage 7: Candidate decisions assembly
+    """
+    model_id = attrs.get("model_id", "")
+    model_kind = attrs.get("model_kind", "text_causal_lm")
+    modalities = attrs.get("modalities", ["text"])
+
+    # Stage 2: Candidate Serving Context Selection
+    native_ctx = attrs.get("context_length")
+    user_ctx = user_overrides.get("max_model_len")
+    if user_ctx is not None:
+        serving_context = int(user_ctx)
+        ctx_source = "user_override"
+        ctx_rationale = f"User explicitly specified max_model_len={serving_context}."
+        ctx_confidence = "high"
+        ctx_warning = None
+    elif native_ctx is not None and native_ctx > 0:
+        serving_context = min(native_ctx, 4096)
+        if model_kind == "multimodal_causal_lm":
+            serving_context = max(serving_context, 512)
+        ctx_source = "bounded_native_context"
+        ctx_rationale = (
+            f"Bounded native context ({native_ctx}) to min(native_context, 4096) "
+            "for stable dual T4 VRAM budget."
+        )
+        ctx_confidence = "high"
+        ctx_warning = None
+    else:
+        serving_context = 2048
+        ctx_source = "safe_candidate_fallback"
+        ctx_rationale = (
+            "Native model context length is unknown; selected 2048 as safe candidate fallback."
+        )
+        ctx_confidence = "heuristic"
+        ctx_warning = (
+            "Native model context length is UNKNOWN in config.json. Using safe candidate "
+            "fallback (2048). Verify model context before large-prompt serving."
+        )
+
+    # Concurrency (Smoke test default = 1)
+    user_seqs = user_overrides.get("max_num_seqs")
+    if user_seqs is not None:
+        max_num_seqs = int(user_seqs)
+        seqs_source = "user_override"
+        seqs_rationale = f"User explicitly specified max_num_seqs={max_num_seqs}."
+        seqs_confidence = "high"
+        seqs_warning = None
+    else:
+        max_num_seqs = 1
+        seqs_source = "smoke_test_default"
+        seqs_rationale = (
+            "Conservative single-sequence concurrency for initial smoke testing and stable VRAM reservation."
+        )
+        seqs_confidence = "high"
+        seqs_warning = None
+
+    # Stage 3: Memory Footprint Estimation
+    mem_est = estimate_memory_components(attrs, serving_context, max_num_seqs)
+
+    # Stage 4: Candidate TP Evaluation & Fit Check
+    has_real_gpu = gpu_info.get("available", False)
+    if has_real_gpu:
+        eval_vram = gpu_info.get("per_gpu_vram_gb", REFERENCE_PER_GPU_VRAM_GB)
+        eval_gpus = gpu_info.get("count", 1)
+    else:
+        eval_vram = REFERENCE_PER_GPU_VRAM_GB
+        eval_gpus = 2
+
+    single_workload = mem_est["total_estimated_single_gpu_workload_gb"]
+    single_gpu_threshold = round(eval_vram * 0.85, 2)
+
+    user_tp = user_overrides.get("tensor_parallel_size")
+    if user_tp is not None:
+        rec_tp = int(user_tp)
+        tp_source = "user_override"
+        tp_rationale = f"User explicitly specified tensor_parallel_size={rec_tp}."
+        tp_confidence = "high"
+        tp_warning = None
+    elif single_workload <= single_gpu_threshold:
+        rec_tp = 1
+        tp_source = "memory_aware_single_gpu_fit"
+        tp_rationale = (
+            f"Estimated single-GPU workload ({single_workload:.2f} GB) fits comfortably within "
+            f"single GPU VRAM threshold ({single_gpu_threshold:.2f} GB)."
+        )
+        tp_confidence = (
+            "high" if mem_est["weights"]["confidence"] == "high" else "medium"
+        )
+        tp_warning = None
+    elif eval_gpus >= 2:
+        rec_tp = 2
+        tp_source = "memory_aware_dual_gpu_fit"
+        tp_rationale = (
+            f"Single-GPU workload ({single_workload:.2f} GB) exceeds single GPU threshold ({single_gpu_threshold:.2f} GB); "
+            "workload fits across 2 GPUs with TP=2."
+        )
+        tp_confidence = (
+            "high" if mem_est["weights"]["confidence"] == "high" else "medium"
+        )
+        tp_warning = None
+    else:
+        rec_tp = 1
+        tp_source = "hardware_constrained"
+        tp_rationale = (
+            f"Single-GPU workload ({single_workload:.2f} GB) exceeds safe threshold ({single_gpu_threshold:.2f} GB), "
+            "but only 1 GPU is available."
+        )
+        tp_confidence = "medium"
+        tp_warning = (
+            "Workload exceeds single-GPU safe capacity and only 1 GPU is available."
+        )
+
+    # Per-GPU memory breakdown under rec_tp
+    attn_dim = attrs.get("attention_dimensions") or {}
+    n_kv_heads = attn_dim.get("num_key_value_heads")
+
+    w_per_gpu = round(mem_est["weights"]["value"] / float(rec_tp), 2)
+    v_per_gpu = mem_est["visual"]["value"]  # Conservatively replicated under TP=2
+    v_sharding_note = (
+        "replicated across ranks (conservative assumption)"
+        if rec_tp > 1 and v_per_gpu > 0
+        else ("single_gpu" if rec_tp == 1 else "not_applicable")
+    )
+
+    if rec_tp == 1:
+        kv_per_gpu = mem_est["kv_cache"]["value"]
+        kv_sharding_note = "single_gpu"
+    else:
+        if n_kv_heads is not None and n_kv_heads >= rec_tp:
+            kv_per_gpu = round(mem_est["kv_cache"]["value"] / float(rec_tp), 2)
+            kv_sharding_note = (
+                f"sharded across {rec_tp} ranks (num_kv_heads={n_kv_heads} >= {rec_tp})"
+            )
+        else:
+            kv_per_gpu = mem_est["kv_cache"]["value"]
+            kv_sharding_note = (
+                f"replicated across ranks (num_kv_heads={n_kv_heads} < {rec_tp} or unknown)"
+            )
+
+    cuda_per_gpu = mem_est["cuda_runtime"]["value"]
+
+    # Stage 5: Utilization Calculation vs Deployment Policy Bounds
+    target_kv = max(kv_per_gpu, 1.0)
+    per_gpu_workload = round(w_per_gpu + v_per_gpu + cuda_per_gpu + target_kv, 2)
+    raw_util = round(per_gpu_workload / eval_vram, 2)
+    clamped_util = round(
+        min(max(raw_util, POLICY_UTILIZATION_MIN), POLICY_UTILIZATION_MAX), 2
+    )
+
+    user_util = user_overrides.get("gpu_memory_utilization")
+    if user_util is not None:
+        final_util = float(user_util)
+        util_source = "user_override"
+        util_rationale = (
+            f"User explicitly specified gpu_memory_utilization={final_util}."
+        )
+        util_confidence = "high"
+        util_warning = None
+    else:
+        final_util = clamped_util
+        util_source = "calculated_from_memory_requirements"
+        util_rationale = (
+            f"Calculated from estimated per-GPU memory ({per_gpu_workload:.2f} GB / {eval_vram:.2f} GB = {raw_util:.2f}) "
+            f"and clamped to deployment policy bounds [{POLICY_UTILIZATION_MIN:.2f}, {POLICY_UTILIZATION_MAX:.2f}]."
+        )
+        util_confidence = (
+            "high" if mem_est["weights"]["confidence"] == "high" else "medium"
+        )
+        util_warning = None
+
+    # DType Selection (T4 coercion to float16)
+    user_dtype = user_overrides.get("dtype")
+    native_dtype = attrs.get("torch_dtype")
+    if user_dtype is not None:
+        final_dtype = str(user_dtype)
+        dtype_source = "user_override"
+        dtype_rationale = f"User explicitly specified dtype={final_dtype}."
+        dtype_confidence = "high"
+        dtype_warning = None
+    else:
+        final_dtype = "float16"
+        if native_dtype and str(native_dtype).lower() in ("bfloat16", "bf16"):
+            dtype_source = "t4_hardware_constraint"
+            dtype_rationale = (
+                "Tesla T4 (Compute Capability 7.5) lacks native bfloat16 execution units; "
+                "coerced to float16 for hardware stability."
+            )
+            dtype_confidence = "high"
+            dtype_warning = (
+                "Model weights are natively bfloat16. Serving on Tesla T4 downcasts to float16; "
+                "verify numeric stability during inference."
+            )
+        else:
+            dtype_source = "hardware_safe_default"
+            dtype_rationale = "Safe 16-bit precision default for NVIDIA Tesla T4."
+            dtype_confidence = "high"
+            dtype_warning = None
+
+    # Quantization
+    user_quant = user_overrides.get("quantization")
+    native_quant = attrs.get("quantization_method")
+    if user_quant is not None:
+        if str(user_quant).lower() in ("none", "null", "false", ""):
+            final_quant = None
+        else:
+            final_quant = str(user_quant)
+        quant_source = "user_override"
+        quant_rationale = f"User explicitly specified quantization={final_quant}."
+        quant_confidence = "high"
+        quant_warning = None
+    else:
+        final_quant = native_quant
+        quant_source = "hf_model_metadata" if native_quant else "none_detected"
+        quant_rationale = (
+            f"Detected from Hugging Face repository metadata: {final_quant or 'unquantized 16-bit'}."
+        )
+        quant_confidence = "high"
+        quant_warning = None
+
+    # Trust Remote Code
+    user_trc = user_overrides.get("trust_remote_code")
+    if user_trc is not None:
+        final_trc = bool(user_trc)
+        trc_source = "user_override"
+        trc_rationale = f"User explicitly specified trust_remote_code={final_trc}."
+    else:
+        final_trc = bool(attrs.get("requires_remote_code", False))
+        trc_source = "hf_config_auto_map" if final_trc else "safe_default_disabled"
+        trc_rationale = (
+            "Model repository config specifies custom modeling in auto_map."
+            if final_trc
+            else "Standard supported model architecture; custom remote code disabled for safety."
+        )
+
+    # Enforce Eager
+    user_ee = user_overrides.get("enforce_eager")
+    if user_ee is not None:
+        final_ee = bool(user_ee)
+        ee_source = "user_override"
+        ee_rationale = f"User explicitly specified enforce_eager={final_ee}."
+    else:
+        final_ee = True
+        ee_source = "t4_hardware_policy"
+        ee_rationale = (
+            "Enforce eager execution to eliminate CUDA graph memory capture overhead on dual T4."
+        )
+
+    # Served Model Name
+    user_name = user_overrides.get("served_model_name")
+    if user_name:
+        final_name = str(user_name)
+        name_source = "user_override"
+    else:
+        final_name = sanitize_served_name(model_id or "model")
+        name_source = "derived_from_model_id"
+
+    # Extra Args
+    extra_args_input = user_overrides.get("extra_vllm_args")
+    extra_args: List[str] = []
+    if extra_args_input:
+        if isinstance(extra_args_input, list):
+            extra_args = [str(a) for a in extra_args_input]
+        elif isinstance(extra_args_input, str) and extra_args_input.strip():
+            extra_args = shlex.split(extra_args_input.strip())
+
+    # Stage 6: vLLM Version Compatibility Check
+    vllm_ver = detect_installed_vllm_version()
+    vllm_compat = check_vllm_version_compatibility(
+        attrs.get("architectures", []), vllm_ver
+    )
+
+    # Stage 7: Candidate Decisions Assembly
+    decisions = {
+        "tensor_parallel_size": {
+            "value": rec_tp,
+            "source": tp_source,
+            "rationale": tp_rationale,
+            "confidence": tp_confidence,
+            "warning": tp_warning,
+        },
+        "max_model_len": {
+            "value": serving_context,
+            "native_context": native_ctx,
+            "source": ctx_source,
+            "rationale": ctx_rationale,
+            "confidence": ctx_confidence,
+            "warning": ctx_warning,
+        },
+        "max_num_seqs": {
+            "value": max_num_seqs,
+            "source": seqs_source,
+            "rationale": seqs_rationale,
+            "confidence": seqs_confidence,
+            "warning": seqs_warning,
+        },
+        "gpu_memory_utilization": {
+            "value": final_util,
+            "raw_calculated": raw_util,
+            "policy_clamped": clamped_util,
+            "policy_bounds": [POLICY_UTILIZATION_MIN, POLICY_UTILIZATION_MAX],
+            "source": util_source,
+            "rationale": util_rationale,
+            "confidence": util_confidence,
+            "warning": util_warning,
+        },
+        "dtype": {
+            "value": final_dtype,
+            "native_dtype": native_dtype,
+            "source": dtype_source,
+            "rationale": dtype_rationale,
+            "confidence": dtype_confidence,
+            "warning": dtype_warning,
+        },
+        "quantization": {
+            "value": final_quant,
+            "source": quant_source,
+            "rationale": quant_rationale,
+            "confidence": quant_confidence,
+            "warning": quant_warning,
+        },
+        "trust_remote_code": {
+            "value": final_trc,
+            "source": trc_source,
+            "rationale": trc_rationale,
+            "confidence": "high",
+            "warning": None,
+        },
+        "enforce_eager": {
+            "value": final_ee,
+            "source": ee_source,
+            "rationale": ee_rationale,
+            "confidence": "high",
+            "warning": None,
+        },
+        "served_model_name": {
+            "value": final_name,
+            "source": name_source,
+            "rationale": "OpenAI API alias name.",
+            "confidence": "high",
+            "warning": None,
+        },
+    }
+
+    cmd_args: List[str] = [
+        "vllm",
+        "serve",
+        model_id,
+        "--served-model-name",
+        final_name,
+        "--host",
+        DEFAULT_HOST,
+        "--port",
+        str(DEFAULT_PORT),
+        "--tensor-parallel-size",
+        str(rec_tp),
+        "--dtype",
+        str(final_dtype),
+        "--max-model-len",
+        str(serving_context),
+        "--max-num-seqs",
+        str(max_num_seqs),
+        "--gpu-memory-utilization",
+        str(final_util),
+    ]
+
+    if final_quant:
+        cmd_args.extend(["--quantization", str(final_quant)])
+
+    if final_ee:
+        cmd_args.append("--enforce-eager")
+
+    if final_trc:
+        cmd_args.append("--trust-remote-code")
+
+    if extra_args:
+        cmd_args.extend(extra_args)
+
+    return {
+        "status": "CANDIDATE_RECOMMENDED",
+        "model_id": model_id,
+        "model_kind": model_kind,
+        "modalities": modalities,
+        "served_model_name": final_name,
+        "tensor_parallel_size": rec_tp,
+        "dtype": final_dtype,
+        "quantization": final_quant,
+        "max_model_len": serving_context,
+        "max_num_seqs": max_num_seqs,
+        "gpu_memory_utilization": final_util,
+        "enforce_eager": final_ee,
+        "trust_remote_code": final_trc,
+        "extra_vllm_args": extra_args,
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "command_args": cmd_args,
+        "command_str": " ".join(f"'{a}'" if " " in a else a for a in cmd_args),
+        "vllm_version_check": vllm_compat,
+        "memory_breakdown": {
+            "estimated_components": mem_est,
+            "per_gpu_workload_gb": {
+                "weights": w_per_gpu,
+                "visual": v_per_gpu,
+                "visual_sharding": v_sharding_note,
+                "kv_cache": kv_per_gpu,
+                "kv_sharding": kv_sharding_note,
+                "cuda_runtime": cuda_per_gpu,
+                "total": per_gpu_workload,
+            },
+            "eval_hardware": {
+                "per_gpu_vram_gb": eval_vram,
+                "gpu_count": eval_gpus,
+                "is_simulated_reference": not has_real_gpu,
+            },
+        },
+        "decisions": decisions,
+    }
+
+
 def validate_compatibility(
     model_id: str,
     attrs: Dict[str, Any],
@@ -381,7 +1149,7 @@ def validate_compatibility(
     user_overrides: Dict[str, Any],
 ) -> List[str]:
     """
-    Validates model compatibility against dual Tesla T4 constraints and vLLM.
+    Validates model compatibility against hardware constraints, memory budget, and vLLM.
     Returns list of fatal error messages (empty if compatible).
     """
     errors: List[str] = []
@@ -436,54 +1204,76 @@ def validate_compatibility(
             "Please select an AWQ, GPTQ, or unquantized 16-bit model."
         )
 
-    # 3. Hardware: Tensor Parallel Size vs Available GPUs
-    tp_size = user_overrides.get("tensor_parallel_size")
-    if tp_size is None:
-        tp_size = DEFAULT_TENSOR_PARALLEL_SIZE
-    if tp_size <= 0:
-        errors.append(f"Invalid tensor_parallel_size ({tp_size}). Must be >= 1.")
-    elif gpu_info["available"] and gpu_info["count"] < tp_size:
-        errors.append(
-            f"Requested tensor_parallel_size ({tp_size}) exceeds detected GPU count ({gpu_info['count']}). "
-            "Dual T4 requires 2 GPUs; verify accelerator setting 'GPU T4 x2' in Kaggle."
-        )
+    # 3. vLLM Version Compatibility Check
+    installed_vllm = detect_installed_vllm_version()
+    vllm_compat = check_vllm_version_compatibility(archs, installed_vllm)
+    if not vllm_compat["compatible"]:
+        errors.append(vllm_compat["warning"])
 
-    # 4. Hardware: VRAM Footprint Estimation (Heuristic Safety Policy)
+    # 4. Hardware: Tensor Parallel Size vs Available GPUs
+    tp_size = user_overrides.get("tensor_parallel_size")
+    if tp_size is not None:
+        if tp_size <= 0:
+            errors.append(f"Invalid tensor_parallel_size ({tp_size}). Must be >= 1.")
+        elif gpu_info.get("available") and gpu_info.get("count", 0) < tp_size:
+            errors.append(
+                f"Requested tensor_parallel_size ({tp_size}) exceeds detected GPU count ({gpu_info['count']}). "
+                "Dual T4 requires 2 GPUs; verify accelerator setting 'GPU T4 x2' in Kaggle."
+            )
+
+    # 5. Hardware: Memory Capacity & Fit Validation
     if param_count and param_count > 0:
         params_billions = param_count / 1_000_000_000.0
-        # Multimodal models have visual encoder overhead (~1.0 GB)
         mm_overhead = 1.0 if model_kind == "multimodal_causal_lm" else 0.0
 
-        if not quant_method:
-            # Unquantized 16-bit (~2.0 bytes per parameter) + multimodal encoder
-            est_vram_gb = params_billions * 2.0 + mm_overhead
-            if est_vram_gb > DUAL_T4_TOTAL_VRAM_GB:
+        if quant_method in ("awq", "gptq"):
+            b_per_param = 0.6
+        elif quant_method in ("int8", "bitsandbytes"):
+            b_per_param = 1.0
+        elif quant_method == "fp8":
+            b_per_param = 1.0
+        else:
+            b_per_param = 2.0
+
+        weight_gb = params_billions * b_per_param
+
+        has_gpus = gpu_info.get("available", False)
+        detected_count = gpu_info.get("count", 0)
+        per_gpu_vram = (
+            gpu_info.get("per_gpu_vram_gb", REFERENCE_PER_GPU_VRAM_GB)
+            if has_gpus
+            else REFERENCE_PER_GPU_VRAM_GB
+        )
+
+        # Single GPU system constraint or forced TP=1 check
+        if (has_gpus and detected_count == 1) or user_overrides.get(
+            "tensor_parallel_size"
+        ) == 1:
+            single_required = weight_gb + mm_overhead + 1.0 + 1.0
+            if single_required > (per_gpu_vram * 0.95):
                 errors.append(
-                    f"Model parameter count (~{params_billions:.1f}B) in unquantized 16-bit requires "
-                    f"~{est_vram_gb:.1f} GB VRAM for weights and vision encoder, which exceeds the total usable VRAM "
-                    f"of Kaggle dual Tesla T4s (~{DUAL_T4_TOTAL_VRAM_GB:.1f} GB). "
+                    f"Model workload (~{single_required:.1f} GB) exceeds single GPU usable VRAM (~{per_gpu_vram:.1f} GB). "
+                    "Dual GPU (TP=2) or 4-bit quantization is required."
+                )
+        else:
+            # Dual GPU evaluation (or reference dual T4)
+            dual_per_gpu = (weight_gb / 2.0) + mm_overhead + 1.0 + 1.0
+            if dual_per_gpu > (per_gpu_vram * 0.95):
+                errors.append(
+                    f"Model parameter count (~{params_billions:.1f}B) requires estimated ~{dual_per_gpu:.1f} GB per GPU "
+                    f"under TP=2, which exceeds usable capacity of dual Tesla T4s (~{per_gpu_vram:.1f} GB per GPU). "
                     "Remediation: Choose an AWQ or GPTQ 4-bit quantized version of this model."
                 )
-        elif quant_method in ("awq", "gptq"):
-            # 4-bit quantization (~0.55-0.65 bytes per parameter) + multimodal encoder
-            est_vram_gb = params_billions * 0.6 + mm_overhead
-            if est_vram_gb > (DUAL_T4_TOTAL_VRAM_GB * 0.85):
-                errors.append(
-                    f"Quantized 4-bit model (~{params_billions:.1f}B parameters) requires estimated "
-                    f"~{est_vram_gb:.1f} GB VRAM, exceeding dual T4 capacity with safety margins. "
-                    "Models larger than 32B typically cannot fit on dual Tesla T4s."
-                )
 
-    # 5. Context Length Validation
+    # 6. Context Length Validation
     max_len = user_overrides.get("max_model_len")
-    if max_len is None:
-        max_len = DEFAULT_MAX_MODEL_LEN
-    min_allowed_len = 512 if model_kind == "multimodal_causal_lm" else 128
-    if max_len < min_allowed_len:
-        errors.append(
-            f"Invalid max_model_len ({max_len}). Must be >= {min_allowed_len} "
-            f"({'multimodal models require sequence budget for visual image tokens and text prompt' if model_kind == 'multimodal_causal_lm' else 'minimum required length'})."
-        )
+    if max_len is not None:
+        min_allowed_len = 512 if model_kind == "multimodal_causal_lm" else 128
+        if max_len < min_allowed_len:
+            errors.append(
+                f"Invalid max_model_len ({max_len}). Must be >= {min_allowed_len} "
+                f"({'multimodal models require sequence budget for visual image tokens and text prompt' if model_kind == 'multimodal_causal_lm' else 'minimum required length'})."
+            )
 
     return errors
 
@@ -492,131 +1282,17 @@ def resolve_configuration(
     model_id: str,
     attrs: Dict[str, Any],
     user_overrides: Dict[str, Any],
+    gpu_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Resolves final vLLM execution arguments using precedence:
-      User Overrides -> Model Metadata -> Safe Defaults
+    Resolves candidate vLLM configuration using automatic memory-aware recommendation
+    with strict user override precedence.
     """
-    model_kind = attrs.get("model_kind", "text_causal_lm")
-    modalities = attrs.get("modalities", ["text"])
-
-    # Served model name
-    served_name = (
-        user_overrides.get("served_model_name")
-        or sanitize_served_name(model_id)
-    )
-
-    # Tensor parallel size
-    tp = user_overrides.get("tensor_parallel_size")
-    if tp is None:
-        tp = DEFAULT_TENSOR_PARALLEL_SIZE
-
-    # Quantization
-    quant = user_overrides.get("quantization") or attrs.get("quantization_method")
-    if quant and quant.lower() in ("none", "null", "false", ""):
-        quant = None
-
-    # DType: Tesla T4 must use float16 by default because CC 7.5 lacks hardware bfloat16
-    dtype = user_overrides.get("dtype")
-    if not dtype:
-        dtype = DEFAULT_DTYPE
-
-    # Max Model Length
-    native_ctx = attrs.get("context_length")
-    max_len = user_overrides.get("max_model_len")
-    if max_len is None:
-        max_len = DEFAULT_MAX_MODEL_LEN
-    if native_ctx and native_ctx < max_len:
-        # Bound to native context length if smaller
-        max_len = native_ctx
-
-    # Concurrency and GPU memory utilization
-    max_seqs = user_overrides.get("max_num_seqs")
-    if max_seqs is None:
-        max_seqs = DEFAULT_MAX_NUM_SEQS
-
-    gpu_mem = user_overrides.get("gpu_memory_utilization")
-    if gpu_mem is None:
-        gpu_mem = DEFAULT_GPU_MEMORY_UTILIZATION
-
-    # Enforce eager: T4 benefits heavily from --enforce-eager to avoid CUDA graph VRAM overhead
-    enforce_eager = user_overrides.get("enforce_eager")
-    if enforce_eager is None:
-        enforce_eager = DEFAULT_ENFORCE_EAGER
-
-    # Trust remote code precedence:
-    # 1. User override (explicit True/False)
-    # 2. Model metadata (requires_remote_code / auto_map in config)
-    # 3. Default: False (do not blindly enable when unnecessary)
-    trust_remote = user_overrides.get("trust_remote_code")
-    if trust_remote is None:
-        trust_remote = bool(attrs.get("requires_remote_code", False))
-
-    # Parse extra_vllm_args if provided
-    extra_args_input = user_overrides.get("extra_vllm_args")
-    extra_args: List[str] = []
-    if extra_args_input:
-        if isinstance(extra_args_input, list):
-            extra_args = [str(a) for a in extra_args_input]
-        elif isinstance(extra_args_input, str) and extra_args_input.strip():
-            import shlex
-            extra_args = shlex.split(extra_args_input.strip())
-
-    # Build exact vllm CLI arguments
-    cmd_args: List[str] = [
-        "vllm",
-        "serve",
-        model_id,
-        "--served-model-name",
-        served_name,
-        "--host",
-        DEFAULT_HOST,
-        "--port",
-        str(DEFAULT_PORT),
-        "--tensor-parallel-size",
-        str(tp),
-        "--dtype",
-        str(dtype),
-        "--max-model-len",
-        str(max_len),
-        "--max-num-seqs",
-        str(max_seqs),
-        "--gpu-memory-utilization",
-        str(gpu_mem),
-    ]
-
-    if quant:
-        cmd_args.extend(["--quantization", str(quant)])
-
-    if enforce_eager:
-        cmd_args.append("--enforce-eager")
-
-    if trust_remote:
-        cmd_args.append("--trust-remote-code")
-
-    if extra_args:
-        cmd_args.extend(extra_args)
-
-    return {
-        "status": "PASS",
-        "model_id": model_id,
-        "model_kind": model_kind,
-        "modalities": modalities,
-        "served_model_name": served_name,
-        "tensor_parallel_size": tp,
-        "dtype": dtype,
-        "quantization": quant,
-        "max_model_len": max_len,
-        "max_num_seqs": max_seqs,
-        "gpu_memory_utilization": gpu_mem,
-        "enforce_eager": enforce_eager,
-        "trust_remote_code": trust_remote,
-        "extra_vllm_args": extra_args,
-        "host": DEFAULT_HOST,
-        "port": DEFAULT_PORT,
-        "command_args": cmd_args,
-        "command_str": " ".join(f"'{a}'" if " " in a else a for a in cmd_args),
-    }
+    if gpu_info is None:
+        gpu_info = detect_gpus()
+    attrs_copy = dict(attrs)
+    attrs_copy["model_id"] = model_id
+    return recommend_configuration(attrs_copy, gpu_info, user_overrides)
 
 
 def print_diagnostic_report(
@@ -626,13 +1302,14 @@ def print_diagnostic_report(
     resolved: Dict[str, Any],
     hf_token: Optional[str],
 ) -> None:
-    """Prints a clean human-readable diagnostic report to stderr/stdout."""
+    """Prints a clean human-readable diagnostic report with 5 clear sections and advisory notice."""
     p = sys.stderr.write
-    p("\n" + "=" * 64 + "\n")
+    p("\n" + "=" * 68 + "\n")
     p(" RELAY KAGGLE DEPLOYMENT PREFLIGHT REPORT\n")
-    p("=" * 64 + "\n")
+    p("=" * 68 + "\n")
 
-    p(" [1] Target Hugging Face Model\n")
+    # Section 1: Target Hugging Face Model Facts
+    p(" [1] Discovered Model Facts\n")
     p(f"     Model ID:          {model_id}\n")
     p(f"     Model Kind:        {attrs.get('model_kind') or 'text_causal_lm'}\n")
     p(f"     Modalities:        {', '.join(attrs.get('modalities') or ['text'])}\n")
@@ -644,45 +1321,124 @@ def print_diagnostic_report(
         else "Unknown / unlisted"
     )
     p(f"     Parameter Count:   {param_str}\n")
-    p(f"     Detected Quant:    {attrs.get('quantization_method') or 'None (16-bit)'}\n")
-    p(f"     Config DType:      {attrs.get('torch_dtype') or 'Not specified'}\n")
-    p(f"     Context Length:    {attrs.get('context_length') or 'Default'}\n")
+    p(
+        f"     Detected Quant:    {attrs.get('quantization_method') or 'None (16-bit)'}\n"
+    )
+    p(f"     Native DType:      {attrs.get('torch_dtype') or 'Not specified'}\n")
+    p(f"     Native Context:    {attrs.get('context_length') or 'Unknown'}\n")
+    p(
+        f"     Remote Code:       {'Required (auto_map in config)' if attrs.get('requires_remote_code') else 'Disabled (standard)'}\n"
+    )
     p(f"     Gated Repository:  {'Yes' if attrs.get('gated') else 'No'}\n")
     p(f"     HF Token Status:   {mask_token(hf_token)}\n\n")
 
-    p(" [2] Hardware Environment\n")
-    if gpu_info["available"]:
+    # Section 2: Detected Hardware Environment
+    p(" [2] Detected Hardware Environment\n")
+    status_str = gpu_info.get("status", "UNKNOWN_NO_GPU")
+    if gpu_info.get("available"):
+        p(f"     Hardware Status:   {status_str}\n")
         p(f"     GPU Count:         {gpu_info['count']}\n")
         for dev in gpu_info["devices"]:
-            p(f"       - GPU {dev['index']}: {dev['name']} ({dev['memory_mb']:.0f} MiB)\n")
+            p(
+                f"       - GPU {dev['index']}: {dev['name']} ({dev['memory_mb']:.0f} MiB)\n"
+            )
+        p(f"     Per-GPU VRAM:      {gpu_info['per_gpu_vram_gb']} GB\n")
         p(f"     Total VRAM:        {gpu_info['total_vram_gb']} GB\n")
-        p(f"     Hardware Class:    {'NVIDIA Tesla T4 (Turing CC 7.5)' if gpu_info['is_tesla_t4'] else 'Custom GPU'}\n\n")
+        p(
+            f"     Hardware Class:    {'NVIDIA Tesla T4 (Turing CC 7.5)' if gpu_info['is_tesla_t4'] else 'Custom GPU'}\n\n"
+        )
     else:
-        p("     GPU Status:        No GPU detected via nvidia-smi (Local/Test mode)\n\n")
+        p(
+            f"     Hardware Status:   {status_str} (Evaluated against reference dual Tesla T4 profile)\n"
+        )
+        p(
+            f"     Reference Specs:   2x NVIDIA Tesla T4 (~{REFERENCE_PER_GPU_VRAM_GB} GB per GPU, {REFERENCE_TOTAL_VRAM_GB} GB total)\n\n"
+        )
 
-    p(" [3] Resolved vLLM Configuration\n")
-    p(f"     Served Alias:      {resolved['served_model_name']}\n")
-    p(f"     Model Kind:        {resolved.get('model_kind')}\n")
-    p(f"     Modalities:        {', '.join(resolved.get('modalities') or [])}\n")
-    p(f"     Tensor Parallel:   {resolved['tensor_parallel_size']}\n")
-    p(f"     Execution DType:   {resolved['dtype']} (Safe for Turing CC 7.5)\n")
-    p(f"     Quantization:      {resolved['quantization'] or 'None'}\n")
-    p(f"     Max Model Len:     {resolved['max_model_len']}\n")
-    p(f"     Max Num Seqs:      {resolved['max_num_seqs']}\n")
-    p(f"     GPU Memory Util:   {resolved['gpu_memory_utilization']}\n")
-    p(f"     Enforce Eager:     {resolved['enforce_eager']}\n")
-    p(f"     Trust Remote Code: {resolved['trust_remote_code']}\n")
+    # Section 3: Estimated Memory Footprint
+    mem = resolved.get("memory_breakdown", {})
+    comps = mem.get("estimated_components", {})
+    per_gpu = mem.get("per_gpu_workload_gb", {})
+    p(" [3] Estimated Memory Footprint\n")
+    if comps:
+        w = comps.get("weights", {})
+        v = comps.get("visual", {})
+        k = comps.get("kv_cache", {})
+        c = comps.get("cuda_runtime", {})
+        p(
+            f"     Weights Memory:    {w.get('value', 0.0):.2f} GB (source: {w.get('source')}, confidence: {w.get('confidence')})\n"
+        )
+        if w.get("warning"):
+            p(f"                        [WARN] {w['warning']}\n")
+        p(
+            f"     Visual Encoder:    {v.get('value', 0.0):.2f} GB (source: {v.get('source')}, confidence: {v.get('confidence')})\n"
+        )
+        if v.get("warning"):
+            p(f"                        [WARN] {v['warning']}\n")
+        p(
+            f"     KV Cache Buffer:   {k.get('value', 0.0):.2f} GB (source: {k.get('source')}, confidence: {k.get('confidence')})\n"
+        )
+        if k.get("warning"):
+            p(f"                        [WARN] {k['warning']}\n")
+        p(
+            f"     CUDA Runtime:      {c.get('value', 0.0):.2f} GB (source: {c.get('source')})\n"
+        )
+        p(
+            f"     Single-GPU Total:  {comps.get('total_estimated_single_gpu_workload_gb', 0.0):.2f} GB\n"
+        )
+        if per_gpu:
+            p(
+                f"     Per-GPU Breakdown: {per_gpu.get('total', 0.0):.2f} GB/GPU under TP={resolved.get('tensor_parallel_size')}\n"
+            )
+            p(
+                f"                        (Weights: {per_gpu.get('weights', 0.0):.2f} GB, Visual: {per_gpu.get('visual', 0.0):.2f} GB [{per_gpu.get('visual_sharding')}], KV: {per_gpu.get('kv_cache', 0.0):.2f} GB [{per_gpu.get('kv_sharding')}])\n"
+            )
+    p("\n")
+
+    # Section 4: Candidate Deployment Decisions
+    decs = resolved.get("decisions", {})
+    p(" [4] Candidate Deployment Decisions\n")
+    for key, label in [
+        ("tensor_parallel_size", "Tensor Parallel"),
+        ("max_model_len", "Serving Context"),
+        ("max_num_seqs", "Max Num Seqs"),
+        ("gpu_memory_utilization", "GPU Memory Util"),
+        ("dtype", "Execution DType"),
+        ("quantization", "Quantization"),
+        ("enforce_eager", "Enforce Eager"),
+        ("trust_remote_code", "Trust Remote Code"),
+        ("served_model_name", "Served Model Name"),
+    ]:
+        d = decs.get(key, {})
+        val = d.get("value")
+        src = d.get("source", "default")
+        rat = d.get("rationale")
+        warn = d.get("warning")
+        p(f"     {label:<18} {str(val):<10} (source: {src})\n")
+        if rat:
+            p(f"                        Rationale: {rat}\n")
+        if warn:
+            p(f"                        [WARNING] {warn}\n")
     extra_str = " ".join(resolved.get("extra_vllm_args") or [])
-    p(f"     Extra vLLM Args:   {extra_str if extra_str else 'None'}\n\n")
+    p(f"     {'Extra vLLM Args':<18} {extra_str if extra_str else 'None'}\n\n")
 
-    p(" [4] Generated vLLM Execution Command\n")
-    p(f"     {resolved['command_str']}\n")
-    p("=" * 64 + "\n\n")
+    # Section 5: Generated vLLM Execution Command
+    p(" [5] Generated vLLM Execution Command\n")
+    p(f"     {resolved.get('command_str')}\n\n")
+
+    # Advisory Notice
+    p("=" * 68 + "\n")
+    p(" ADVISORY NOTICE:\n")
+    p(" Preflight establishes CANDIDATE recommendations based on model\n")
+    p(" metadata, architecture facts, and memory heuristics.\n")
+    p(" Runtime compatibility, CUDA allocation, and inference stability\n")
+    p(" must be verified during live server startup in Kaggle.\n")
+    p("=" * 68 + "\n\n")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Relay vLLM Preflight & Compatibility Inspector"
+        description="Relay vLLM Preflight & Candidate Recommendation Engine"
     )
     parser.add_argument(
         "--model-id",
@@ -692,48 +1448,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--served-model-name",
         default=os.environ.get("SERVED_MODEL_NAME"),
-        help="Served model alias name for OpenAI API routing",
+        help="Served model alias name for OpenAI API routing (default: None, auto-recommended)",
     )
+
+    def _parse_int_env(key: str) -> Optional[int]:
+        val = os.environ.get(key)
+        if val is not None and val.strip():
+            try:
+                return int(val.strip())
+            except ValueError:
+                pass
+        return None
+
+    def _parse_float_env(key: str) -> Optional[float]:
+        val = os.environ.get(key)
+        if val is not None and val.strip():
+            try:
+                return float(val.strip())
+            except ValueError:
+                pass
+        return None
+
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=int(os.environ.get("TENSOR_PARALLEL_SIZE", DEFAULT_TENSOR_PARALLEL_SIZE)),
-        help="Tensor parallelism degree across GPUs (default: 2)",
+        default=_parse_int_env("TENSOR_PARALLEL_SIZE"),
+        help="Tensor parallelism degree across GPUs (default: None, auto-recommended)",
     )
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=int(os.environ.get("MAX_MODEL_LEN", DEFAULT_MAX_MODEL_LEN)),
-        help="Maximum model context length (default: 4096)",
+        default=_parse_int_env("MAX_MODEL_LEN"),
+        help="Maximum model context length (default: None, auto-recommended)",
     )
     parser.add_argument(
         "--max-num-seqs",
         type=int,
-        default=int(os.environ.get("MAX_NUM_SEQS", DEFAULT_MAX_NUM_SEQS)),
-        help="Maximum number of concurrent sequences (default: 4)",
+        default=_parse_int_env("MAX_NUM_SEQS"),
+        help="Maximum number of concurrent sequences (default: None, auto-recommended)",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=float(
-            os.environ.get("GPU_MEMORY_UTILIZATION", DEFAULT_GPU_MEMORY_UTILIZATION)
-        ),
-        help="Fraction of VRAM reserved for vLLM (default: 0.85)",
+        default=_parse_float_env("GPU_MEMORY_UTILIZATION"),
+        help="Fraction of VRAM reserved for vLLM (default: None, auto-calculated [0.70-0.92])",
     )
     parser.add_argument(
         "--dtype",
         default=os.environ.get("DTYPE"),
-        help="Precision dtype override (e.g., float16)",
+        help="Precision dtype override (e.g., float16) (default: None, auto-resolved)",
     )
     parser.add_argument(
         "--quantization",
         default=os.environ.get("QUANTIZATION"),
-        help="Quantization method override (e.g., awq, gptq)",
+        help="Quantization method override (e.g., awq, gptq) (default: None, auto-detected)",
     )
     parser.add_argument(
         "--trust-remote-code",
         default=os.environ.get("TRUST_REMOTE_CODE"),
-        help="Whether to pass --trust-remote-code (true/false)",
+        help="Whether to pass --trust-remote-code (true/false) (default: None, auto-resolved)",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        default=os.environ.get("ENFORCE_EAGER"),
+        help="Whether to pass --enforce-eager (true/false) (default: None, auto-resolved)",
     )
     parser.add_argument(
         "--extra-vllm-args",
@@ -784,6 +1562,11 @@ def main() -> None:
             args.trust_remote_code
         ).lower() in ("true", "1", "yes")
 
+    if args.enforce_eager is not None:
+        user_overrides["enforce_eager"] = str(
+            args.enforce_eager
+        ).lower() in ("true", "1", "yes")
+
     # Step 1: Query Hugging Face Hub
     try:
         model_info, config = fetch_hf_model_metadata(model_id, args.hf_token)
@@ -823,7 +1606,9 @@ def main() -> None:
         sys.exit(1)
 
     # Step 4: Resolve Configuration
-    resolved = resolve_configuration(model_id, attrs, user_overrides)
+    resolved = resolve_configuration(
+        model_id, attrs, user_overrides, gpu_info=gpu_info
+    )
 
     if args.json:
         # Output ONLY JSON to stdout

@@ -11,14 +11,14 @@ Two deployment workflows are supported:
 
 ## Script Index
 
-| Script               | Purpose                                                                                         | Key Subcommands                                                                     |
-| :------------------- | :---------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------- |
-| **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.        | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`        |
-| **`preflight.py`**   | Hugging Face Hub inspector and hardware compatibility validator (standard library Python 3.8+). | `--model-id`, `--json`, `--tensor-parallel-size`, `--hf-token`, `--extra-vllm-args` |
-| **`test_image.py`**  | Pure standard library PNG generator and base64 data URI encoder for multimodal OCR smoke tests. | `[text]` (prints `data:image/png;base64,...`)                                       |
-| **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                            | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`                     |
-| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.  | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                               |
-| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.        | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                           |
+| Script               | Purpose                                                                                           | Key Subcommands                                                                                                                                |
+| :------------------- | :------------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.          | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`                                                                   |
+| **`preflight.py`**   | Hugging Face Hub inspector and memory-aware candidate recommendation engine (Python 3.8+ stdlib). | `--model-id`, `--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization`, `--dtype`, `--quantization`, `--json` |
+| **`test_image.py`**  | Pure standard library PNG generator and base64 data URI encoder for multimodal OCR smoke tests.   | `[text]` (prints `data:image/png;base64,...`)                                                                                                  |
+| **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                              | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`                                                                                |
+| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.    | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                                                                                          |
+| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.          | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                                                                                      |
 
 ---
 
@@ -92,19 +92,27 @@ Expected output:
 
 ## Workflow 1: Generic Hugging Face Model Deployment
 
-The generic workflow allows you to deploy any compatible causal language model or multimodal vision/OCR model simply by setting `MODEL_ID`:
+The generic workflow allows you to deploy any compatible causal language model or multimodal vision/OCR model simply by setting `MODEL_ID`. All deployment parameters default to automatic recommendation:
 
 ```bash
 %%bash
 cd /kaggle/working/Relay
 export MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
-export SERVED_MODEL_NAME="qwen2.5-coder-7b"
+
+# Optional deployment overrides (leave unset for automatic recommendation):
+# export TENSOR_PARALLEL_SIZE=""
+# export MAX_MODEL_LEN=""
+# export MAX_NUM_SEQS=""
+# export GPU_MEMORY_UTILIZATION=""
+# export DTYPE=""
+# export QUANTIZATION=""
+# export TRUST_REMOTE_CODE=""
+# export EXTRA_VLLM_ARGS=""
 
 # To deploy GLM-OCR instead:
 # export MODEL_ID="zai-org/GLM-OCR"
-# export SERVED_MODEL_NAME="glm-ocr"
 
-# 1. Preflight validation
+# 1. Preflight validation & automatic candidate recommendation
 ./infra/kaggle/vllm.sh preflight
 
 # 2. Cleanup stale listeners
@@ -123,14 +131,25 @@ export SERVED_MODEL_NAME="qwen2.5-coder-7b"
 ./infra/kaggle/cloudflared.sh start
 ```
 
-### Preflight Compatibility & Hardware Policy
+### Memory-Aware Recommendation Engine & Hardware Policy
 
-The preflight validator (`preflight.py`) inspects model metadata via the official Hugging Face Hub API and validates:
+The preflight engine (`preflight.py`) inspects model metadata via the Hugging Face Hub API and calculates a hardware-safe deployment candidate across 7 stages:
 
-- **Architecture Support**: Validates causal text models (`Qwen2ForCausalLM`, `LlamaForCausalLM`, `MistralForCausalLM`, etc.) and multimodal generative models (`GlmOcrForConditionalGeneration`, `Qwen2VLForConditionalGeneration`, etc.). Rejects encoder-only, audio, classification, and diffusion architectures.
-- **T4 Hardware Precision**: Enforces `float16` by default. Rejects FP8 models because Tesla T4 (Turing CC 7.5) lacks FP8 tensor cores.
-- **VRAM Heuristic**: Estimates total parameter footprint including vision encoder overhead against dual Tesla T4 capacity (~30 GB usable VRAM). Rejects unquantized models > 14B and 4-bit models > 32B with actionable guidance.
-- **Gated Models**: Checks whether model repository is gated/private and verifies that `HF_TOKEN` is present without logging raw secrets.
+1. **Model Discovery**: Reads native parameter count, native context length, native dtype, architecture, attention dimensions (layers, heads, kv_heads, head_dim), and vision configuration.
+2. **Serving Context Selection**: Distinguishes native context from serving context; bounds candidate context to $\min(\text{native\_context}, 4096)$ for text models ($\ge 512$ for multimodal).
+3. **Component-wise Memory Breakdown**: Estimates individual components with explicit source and confidence tracking:
+   - $M_{\text{weights}}$: bytes per parameter based on precision/quantization.
+   - $M_{\text{visual}}$: derived from vision config or conservative heuristic (~1.0 GB) with warning.
+   - $M_{\text{kv}}$: calculated from transformer attention dimensions ($2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{bytes} \times \text{context} \times \text{seqs}$) or heuristic if dimensions are absent.
+   - $M_{\text{cuda\_runtime}}$: fixed 1.0 GB headroom reserve per GPU.
+4. **Candidate TP Evaluation**:
+   - Computes single-GPU footprint: $M_{\text{weights}} + M_{\text{visual}} + M_{\text{cuda}} + M_{\text{kv}}$. If $\le 85\%$ of single-GPU VRAM, selects `TP=1`.
+   - If single GPU is insufficient and 2 GPUs are present, evaluates `TP=2` (visual encoder replicated, KV cache sharded if $\text{kv\_heads} \ge 2$). If $\le 92\%$ per-GPU VRAM, selects `TP=2`.
+   - If hardware has no GPU, reports `UNKNOWN_NO_GPU` and evaluates against the reference dual Tesla T4 profile (15.0 GB per GPU).
+5. **Dynamic Utilization Calculation**: Computes target memory fraction from required per-GPU memory, then clamps to deployment policy bounds `[0.70, 0.92]`. Both raw and clamped values are exposed.
+6. **Architecture & vLLM Version Registry**: Verifies architecture against a registry of known minimum vLLM versions. Reports `UNKNOWN` and requests runtime validation for unlisted architectures.
+7. **T4 Precision Enforcement**: Coerces precision to `float16` for Tesla T4 (CC 7.5 lacks BF16 and FP8 hardware). Emits runtime stability warning for BF16-trained weights.
+8. **Explainable Diagnostics**: Every recommendation decision exposes `{value, source, rationale, confidence, warning}` and marks preflight status as `CANDIDATE_RECOMMENDED` with startup monitoring advice.
 
 ---
 

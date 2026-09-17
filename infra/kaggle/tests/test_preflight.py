@@ -55,44 +55,331 @@ class TestPreflight(unittest.TestCase):
             "qwen3-coder-30b-a3b-instruct-awq",
         )
 
-    def test_default_config_resolution(self):
+    def test_parse_semver(self):
+        self.assertEqual(preflight.parse_semver("0.16.0"), (0, 16, 0))
+        self.assertEqual(preflight.parse_semver("0.29.0.post1"), (0, 29, 0, 1))
+        self.assertTrue(preflight.parse_semver("0.15.0") < preflight.parse_semver("0.16.0"))
+        self.assertTrue(preflight.parse_semver("0.29.0") >= preflight.parse_semver("0.16.0"))
+
+    # 1. GPT-2 Tiny Model Recommendations
+    def test_gpt2_tiny_model_recommendations(self):
+        config = {
+            "architectures": ["GPT2LMHeadModel"],
+            "model_type": "gpt2",
+            "n_positions": 1024,
+            "n_ctx": 1024,
+            "n_embd": 768,
+            "n_head": 12,
+            "n_layer": 12,
+            "torch_dtype": "float32",
+        }
+        model_info = {"id": "openai-community/gpt2"}
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        attrs["param_count"] = 124_000_000
+
+        resolved = preflight.resolve_configuration(
+            "openai-community/gpt2", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+        self.assertEqual(resolved["max_model_len"], 1024)
+        self.assertEqual(resolved["max_num_seqs"], 1)
+        self.assertEqual(resolved["dtype"], "float16")
+        self.assertEqual(resolved["gpu_memory_utilization"], preflight.POLICY_UTILIZATION_MIN)
+        self.assertEqual(
+            resolved["decisions"]["tensor_parallel_size"]["source"],
+            "memory_aware_single_gpu_fit",
+        )
+        self.assertEqual(
+            resolved["decisions"]["max_model_len"]["source"],
+            "bounded_native_context",
+        )
+
+    # 2. Qwen 7B FP16 Recommendations
+    def test_qwen_7b_fp16_recommendations(self):
+        config = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "max_position_embeddings": 32768,
+            "torch_dtype": "bfloat16",
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "hidden_size": 3584,
+            "head_dim": 128,
+        }
+        model_info = {"id": "Qwen/Qwen2.5-Coder-7B-Instruct"}
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        attrs["param_count"] = 7_620_000_000
+
+        resolved = preflight.resolve_configuration(
+            "Qwen/Qwen2.5-Coder-7B-Instruct", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertEqual(resolved["tensor_parallel_size"], 2)
+        self.assertEqual(resolved["max_model_len"], 4096)
+        self.assertEqual(resolved["max_num_seqs"], 1)
+        self.assertEqual(resolved["dtype"], "float16")
+        self.assertEqual(
+            resolved["decisions"]["tensor_parallel_size"]["source"],
+            "memory_aware_dual_gpu_fit",
+        )
+        self.assertIsNotNone(resolved["decisions"]["dtype"]["warning"])
+
+    # 3. Qwen 30B AWQ Recommendations
+    def test_qwen_30b_awq_recommendations(self):
+        config = {
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "model_type": "qwen2_moe",
+            "max_position_embeddings": 32768,
+            "quantization_config": {"quant_method": "awq"},
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "hidden_size": 4096,
+            "head_dim": 128,
+        }
+        model_info = {"id": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"}
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        attrs["param_count"] = 30_500_000_000
+
+        resolved = preflight.resolve_configuration(
+            "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertEqual(resolved["tensor_parallel_size"], 2)
+        self.assertEqual(resolved["quantization"], "awq")
+        self.assertGreaterEqual(resolved["gpu_memory_utilization"], preflight.POLICY_UTILIZATION_MIN)
+        self.assertLessEqual(resolved["gpu_memory_utilization"], preflight.POLICY_UTILIZATION_MAX)
+
+    # 4. GLM-OCR Multimodal Recommendations
+    def test_glm_ocr_multimodal_recommendations(self):
+        config = {
+            "architectures": ["GlmOcrForConditionalGeneration"],
+            "model_type": "glm_ocr",
+            "text_config": {
+                "max_position_embeddings": 131072,
+                "dtype": "bfloat16",
+                "num_hidden_layers": 16,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "hidden_size": 1536,
+                "head_dim": 96,
+            },
+            "vision_config": {
+                "num_parameters": 100_000_000,
+            },
+            "num_parameters": 900_000_000,
+        }
+        model_info = {"id": "zai-org/GLM-OCR"}
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        resolved = preflight.resolve_configuration(
+            "zai-org/GLM-OCR", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertEqual(resolved["model_kind"], "multimodal_causal_lm")
+        self.assertEqual(resolved["modalities"], ["text", "image"])
+        self.assertEqual(resolved["max_model_len"], 4096)
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+        visual_comp = resolved["memory_breakdown"]["estimated_components"]["visual"]
+        self.assertGreater(visual_comp["value"], 0)
+
+    # 5. BF16 to FP16 Runtime Warning
+    def test_bf16_to_fp16_runtime_warning(self):
         attrs = {
             "architectures": ["Qwen2ForCausalLM"],
             "model_type": "qwen2",
-            "context_length": 32768,
             "torch_dtype": "bfloat16",
-            "quantization_method": None,
+            "context_length": 4096,
             "param_count": 7_000_000_000,
-            "requires_remote_code": False,
-            "gated": False,
         }
-        user_overrides = {}
         resolved = preflight.resolve_configuration(
-            "Qwen/Qwen2.5-Coder-7B-Instruct", attrs, user_overrides
+            "test-model", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        dtype_decision = resolved["decisions"]["dtype"]
+        self.assertEqual(dtype_decision["value"], "float16")
+        self.assertEqual(dtype_decision["source"], "t4_hardware_constraint")
+        self.assertIn("downcasts to float16", dtype_decision["warning"])
+
+    # 6. FP8 on T4 Rejection
+    def test_fp8_on_t4_rejection(self):
+        attrs = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "quantization_method": "fp8",
+            "param_count": 8_000_000_000,
+        }
+        errors = preflight.validate_compatibility(
+            "test-fp8", attrs, self.mock_t4_gpu, {}
+        )
+        self.assertTrue(any("FP8" in e and "Tesla T4" in e for e in errors))
+
+    # 7. Unknown Native Context Handling
+    def test_unknown_native_context_handling(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": None,
+            "param_count": 7_000_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            "test-unknown-ctx", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        ctx_decision = resolved["decisions"]["max_model_len"]
+        self.assertEqual(ctx_decision["value"], 2048)
+        self.assertEqual(ctx_decision["source"], "safe_candidate_fallback")
+        self.assertIsNotNone(ctx_decision["warning"])
+        self.assertIn("UNKNOWN", ctx_decision["warning"])
+
+    # 8. Unknown Hardware Handling
+    def test_unknown_hardware_handling(self):
+        no_gpu = {
+            "status": "UNKNOWN_NO_GPU",
+            "available": False,
+            "count": 0,
+            "devices": [],
+            "total_vram_gb": 0.0,
+            "per_gpu_vram_gb": 0.0,
+            "is_tesla_t4": False,
+            "compute_capability": "Unknown",
+        }
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 4096,
+            "param_count": 7_000_000_000,
+        }
+        resolved = preflight.resolve_configuration("test-model", attrs, {}, gpu_info=no_gpu)
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
+        self.assertTrue(
+            resolved["memory_breakdown"]["eval_hardware"]["is_simulated_reference"]
+        )
+        self.assertEqual(resolved["tensor_parallel_size"], 2)
+
+    # 9. Single GPU Fit Selection
+    def test_single_gpu_fit_selection(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 2048,
+            "param_count": 1_500_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            "test-1.5b", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+        self.assertEqual(
+            resolved["decisions"]["tensor_parallel_size"]["source"],
+            "memory_aware_single_gpu_fit",
         )
 
-        self.assertEqual(resolved["status"], "PASS")
-        self.assertEqual(resolved["served_model_name"], "qwen2.5-coder-7b-instruct")
+    # 10. Dual GPU Fit Selection
+    def test_dual_gpu_fit_selection(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 4096,
+            "param_count": 7_000_000_000,
+        }
+        resolved = preflight.resolve_configuration(
+            "test-7b", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
         self.assertEqual(resolved["tensor_parallel_size"], 2)
-        # On T4, default dtype must be float16 even if config has bfloat16
-        self.assertEqual(resolved["dtype"], "float16")
-        self.assertIsNone(resolved["quantization"])
-        self.assertEqual(resolved["max_model_len"], 4096)
-        self.assertEqual(resolved["max_num_seqs"], 4)
-        self.assertEqual(resolved["gpu_memory_utilization"], 0.85)
-        self.assertTrue(resolved["enforce_eager"])
-        # Standard models do not require trust_remote_code
-        self.assertFalse(resolved["trust_remote_code"])
+        self.assertEqual(
+            resolved["decisions"]["tensor_parallel_size"]["source"],
+            "memory_aware_dual_gpu_fit",
+        )
 
-        # Check command construction
-        cmd = resolved["command_str"]
-        self.assertIn("vllm serve Qwen/Qwen2.5-Coder-7B-Instruct", cmd)
-        self.assertIn("--served-model-name qwen2.5-coder-7b-instruct", cmd)
-        self.assertIn("--tensor-parallel-size 2", cmd)
-        self.assertIn("--dtype float16", cmd)
-        self.assertIn("--enforce-eager", cmd)
-        self.assertNotIn("--quantization", cmd)
-        self.assertNotIn("--trust-remote-code", cmd)
+    # 11. Dual GPU Rejection
+    def test_dual_gpu_rejection(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "param_count": 70_000_000_000,
+        }
+        errors = preflight.validate_compatibility(
+            "test-70b", attrs, self.mock_t4_gpu, {}
+        )
+        self.assertTrue(any("exceeds usable capacity of dual Tesla T4s" in e for e in errors))
+
+    # 12. User Overrides Precedence and Source
+    def test_user_overrides_precedence_and_source(self):
+        attrs = {
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "context_length": 8192,
+            "param_count": 7_000_000_000,
+        }
+        user_overrides = {
+            "served_model_name": "custom-alias",
+            "tensor_parallel_size": 1,
+            "max_model_len": 1024,
+            "max_num_seqs": 2,
+            "gpu_memory_utilization": 0.75,
+            "dtype": "float32",
+            "quantization": "awq",
+            "enforce_eager": False,
+            "trust_remote_code": True,
+        }
+        resolved = preflight.resolve_configuration(
+            "test-model", attrs, user_overrides, gpu_info=self.mock_t4_gpu
+        )
+        for k in [
+            "tensor_parallel_size",
+            "max_model_len",
+            "max_num_seqs",
+            "gpu_memory_utilization",
+            "dtype",
+            "quantization",
+            "trust_remote_code",
+            "enforce_eager",
+            "served_model_name",
+        ]:
+            self.assertEqual(resolved["decisions"][k]["source"], "user_override")
+        self.assertEqual(resolved["served_model_name"], "custom-alias")
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+        self.assertEqual(resolved["max_model_len"], 1024)
+        self.assertEqual(resolved["max_num_seqs"], 2)
+        self.assertEqual(resolved["gpu_memory_utilization"], 0.75)
+        self.assertEqual(resolved["dtype"], "float32")
+        self.assertEqual(resolved["quantization"], "awq")
+        self.assertFalse(resolved["enforce_eager"])
+        self.assertTrue(resolved["trust_remote_code"])
+
+    # 13. Unsupported Architecture Rejection
+    def test_unsupported_architecture_rejection(self):
+        attrs = {
+            "architectures": ["BertForMaskedLM"],
+            "model_type": "bert",
+            "param_count": 110_000_000,
+        }
+        errors = preflight.validate_compatibility("bert-base", attrs, self.mock_t4_gpu, {})
+        self.assertTrue(any("not a supported causal language model" in e for e in errors))
+
+    # 14. vLLM Version Compatibility Check
+    def test_vllm_version_compatibility(self):
+        # 1. Incompatible: GLM-OCR requires 0.16.0, installed 0.15.0
+        check_incompat = preflight.check_vllm_version_compatibility(
+            ["GlmOcrForConditionalGeneration"], "0.15.0"
+        )
+        self.assertFalse(check_incompat["compatible"])
+        self.assertEqual(check_incompat["status"], "INCOMPATIBLE")
+        self.assertIn("requires vLLM >= 0.16.0", check_incompat["warning"])
+
+        # 2. Compatible: GLM-OCR with 0.29.0
+        check_compat = preflight.check_vllm_version_compatibility(
+            ["GlmOcrForConditionalGeneration"], "0.29.0"
+        )
+        self.assertTrue(check_compat["compatible"])
+        self.assertEqual(check_compat["status"], "COMPATIBLE")
+
+        # 3. Unknown architecture: reports UNKNOWN
+        check_unknown = preflight.check_vllm_version_compatibility(
+            ["LlamaForCausalLM"], "0.29.0"
+        )
+        self.assertTrue(check_unknown["compatible"])
+        self.assertEqual(check_unknown["status"], "UNKNOWN_REQUIRES_RUNTIME_CHECK")
+        self.assertIn("UNKNOWN", check_unknown["warning"])
 
     def test_trust_remote_code_precedence(self):
         # 1. Model metadata requires remote code
@@ -205,7 +492,7 @@ class TestPreflight(unittest.TestCase):
         errors = preflight.validate_compatibility(
             "Qwen/Qwen2.5-Coder-32B-Instruct", attrs, self.mock_t4_gpu, {}
         )
-        self.assertTrue(any("exceeds the total usable VRAM" in e for e in errors))
+        self.assertTrue(any("exceeds usable capacity of dual Tesla T4s" in e for e in errors))
 
     def test_oversized_4bit_model_rejection(self):
         # 70B in 4-bit requires ~42 GB VRAM -> exceeds 30 GB total
@@ -218,7 +505,7 @@ class TestPreflight(unittest.TestCase):
         errors = preflight.validate_compatibility(
             "casperhansen/llama-3-70b-instruct-awq", attrs, self.mock_t4_gpu, {}
         )
-        self.assertTrue(any("exceeding dual T4 capacity" in e for e in errors))
+        self.assertTrue(any("exceeds usable capacity of dual Tesla T4s" in e for e in errors))
 
     def test_supported_awq_quantized_30b_model(self):
         # 30.5B AWQ model (like Qwen3-Coder-30B AWQ) fits on dual T4 (~15.2 GB total)
@@ -348,7 +635,6 @@ class TestPreflight(unittest.TestCase):
         self.assertIn("--dtype", cmd_args)
         self.assertIn("float16", cmd_args)
         self.assertIn("--gpu-memory-utilization", cmd_args)
-        self.assertIn("0.85", cmd_args)
         self.assertIn("--enforce-eager", cmd_args)
         self.assertEqual(resolved["command_str"], " ".join(cmd_args))
 
@@ -445,7 +731,7 @@ for a in data.get('command_args', []):
 
         # Validate configuration resolution: on T4, bfloat16 must be coerced to float16
         resolved = preflight.resolve_configuration("zai-org/GLM-OCR", attrs, {})
-        self.assertEqual(resolved["status"], "PASS")
+        self.assertEqual(resolved["status"], "CANDIDATE_RECOMMENDED")
         self.assertEqual(resolved["dtype"], "float16")
         self.assertEqual(resolved["served_model_name"], "glm-ocr")
         self.assertEqual(resolved["model_kind"], "multimodal_causal_lm")

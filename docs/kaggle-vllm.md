@@ -79,64 +79,89 @@ The self-service deployment system allows an operator to specify any Hugging Fac
 
 ## Configuration Reference
 
-In [`notebooks/vllm-kaggle.ipynb`](../notebooks/vllm-kaggle.ipynb), the top configuration cell contains all deployment parameters:
+In [`notebooks/vllm-kaggle.ipynb`](../notebooks/vllm-kaggle.ipynb), the top configuration cell contains deployment parameters. By default, only `MODEL_ID` is set; all deployment parameters default to `None` to enable the **memory-aware candidate recommendation engine**:
 
 ```python
-# Target Hugging Face Model (Text Causal LM or Multimodal Vision/OCR LM)
-# Example A (Text Causal LM):
+# 1. Target Hugging Face Model (Text Causal LM or Multimodal Vision/OCR LM)
 MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
-SERVED_MODEL_NAME = "qwen2.5-coder-7b"
 
-# Example B (Multimodal Document / OCR LM):
-# MODEL_ID = "zai-org/GLM-OCR"
-# SERVED_MODEL_NAME = "glm-ocr"
+# 2. Deployment Overrides (Default: None for Automatic Recommendation)
+# When set to None, preflight automatically inspects model facts, calculates memory
+# footprint, and recommends optimal serving settings for the detected hardware.
+SERVED_MODEL_NAME = None      # Auto-resolved: sanitized model alias (e.g., "qwen2.5-coder-7b-instruct")
+TENSOR_PARALLEL_SIZE = None   # Auto-recommended: 1 for small models, 2 when workload requires dual GPUs
+MAX_MODEL_LEN = None          # Auto-recommended: bounded to native context (<= 4096)
+MAX_NUM_SEQS = None           # Auto-recommended: 1 (conservative smoke-test default)
+GPU_MEMORY_UTILIZATION = None # Auto-calculated from estimated memory requirements [0.70 - 0.92]
+DTYPE = None                  # Auto-resolved: "float16" on Tesla T4 (Turing CC 7.5)
+QUANTIZATION = None           # Auto-detected from HF config (e.g. "awq", "gptq")
+TRUST_REMOTE_CODE = None      # Auto-resolved: True if auto_map is defined, else False
+EXTRA_VLLM_ARGS = None        # Optional extra CLI flags (e.g. "--limit-mm-per-prompt image=1")
 
-# Hardware & Concurrency Settings (Defaults optimized for dual Tesla T4)
-TENSOR_PARALLEL_SIZE = 2
-MAX_MODEL_LEN = 4096
-MAX_NUM_SEQS = 4
-GPU_MEMORY_UTILIZATION = 0.85
-
-# Optional Overrides (Set to None to let preflight auto-detect/auto-resolve)
-DTYPE = None          # Auto-resolved: float16 on T4
-QUANTIZATION = None   # Auto-detected from HF config (e.g. awq, gptq)
-TRUST_REMOTE_CODE = None # Auto-resolved: True for custom causal/multimodal LMs
-EXTRA_VLLM_ARGS = None   # Optional additional CLI flags (e.g. "--limit-mm-per-prompt image=1")
-
-# Hugging Face Access Token (for gated/private models)
+# 3. Hugging Face Access Token (for gated/private models)
 HF_TOKEN = None
 ```
 
-### Parameter Explanations
+### Parameter Explanations & Recommendation Behavior
 
-| Parameter                | Default            | Description & Behavior                                                                                                                       |
-| :----------------------- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MODEL_ID`               | _Required_         | Hugging Face repository ID (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct`, `zai-org/GLM-OCR`, `meta-llama/Llama-3.1-8B-Instruct`).                  |
-| `SERVED_MODEL_NAME`      | Sanitized basename | OpenAI API model alias registered in vLLM. Must be a single, clean alias string.                                                             |
-| `TENSOR_PARALLEL_SIZE`   | `2`                | Number of GPUs to shard model weights across. Dual T4 requires `2` for models >= 7B.                                                         |
-| `MAX_MODEL_LEN`          | `4096`             | Context length limit. If the model config defines a smaller context, preflight caps to the native length. Minimum 512 for multimodal models. |
-| `MAX_NUM_SEQS`           | `4`                | Maximum concurrent request sequences handled by vLLM. Preserves VRAM headroom.                                                               |
-| `GPU_MEMORY_UTILIZATION` | `0.85`             | Fraction of GPU memory allocated to vLLM (weights + KV cache). Reserves ~15% for CUDA runtime.                                               |
-| `DTYPE`                  | `None`             | Precision override. Preflight enforces `float16` for Tesla T4.                                                                               |
-| `QUANTIZATION`           | `None`             | Quantization override (`awq`, `gptq`). If `None`, preflight auto-detects from model `config.json`.                                           |
-| `TRUST_REMOTE_CODE`      | `None`             | Automatically set to `True` for causal and multimodal LMs requiring custom modeling code.                                                    |
-| `EXTRA_VLLM_ARGS`        | `None`             | Additional CLI flags passed directly to `vllm serve` (e.g. `--limit-mm-per-prompt image=1`).                                                 |
-| `HF_TOKEN`               | `None`             | Access token for gated or private Hugging Face repositories. Masked in all logs.                                                             |
+| Parameter                | Default (None)   | Recommendation & Resolution Behavior                                                                                                                                               |
+| :----------------------- | :--------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODEL_ID`               | _Required_       | Hugging Face repository ID (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct`, `zai-org/GLM-OCR`, `meta-llama/Llama-3.1-8B-Instruct`).                                                        |
+| `SERVED_MODEL_NAME`      | Auto-resolved    | OpenAI API model alias registered in vLLM. Derived from the model ID basename (sanitized).                                                                                         |
+| `TENSOR_PARALLEL_SIZE`   | Auto-recommended | Recommends `TP=1` if single-GPU workload fits within 85% of GPU VRAM; recommends `TP=2` if dual GPUs are available and required; fails closed if workload exceeds available VRAM.  |
+| `MAX_MODEL_LEN`          | Auto-recommended | Bounded to $\min(\text{native\_context}, 4096)$ for text models ($\ge 512$ for multimodal). If native context is unknown, selects safe fallback `2048` with an explicit warning.   |
+| `MAX_NUM_SEQS`           | Auto-recommended | Defaults to `1` for conservative initial smoke testing and stable VRAM reservation.                                                                                                |
+| `GPU_MEMORY_UTILIZATION` | Auto-calculated  | Dynamically calculated from weights, visual encoder, KV cache, and runtime headroom, then clamped to deployment policy bounds `[0.70, 0.92]`. Both raw and clamped values exposed. |
+| `DTYPE`                  | Auto-resolved    | Coerced to `float16` for Tesla T4 (CC 7.5 lacks native bfloat16 hardware). Emits runtime stability warning for BF16-trained models.                                                |
+| `QUANTIZATION`           | Auto-detected    | Auto-detected from repository `quantization_config` (e.g. `awq`, `gptq`). Rejects FP8 on T4.                                                                                       |
+| `TRUST_REMOTE_CODE`      | Auto-resolved    | Automatically set to `True` if `auto_map` is present in model `config.json`; otherwise `False`.                                                                                    |
+| `EXTRA_VLLM_ARGS`        | `None`           | Additional CLI flags passed directly to `vllm serve` (e.g. `--limit-mm-per-prompt image=1`).                                                                                       |
+| `HF_TOKEN`               | `None`           | Access token for gated or private Hugging Face repositories. Masked in all logs.                                                                                                   |
 
 ---
 
-## Configuration Resolution Precedence
+## Candidate Recommendation Pipeline & Resolution Precedence
 
-Configuration values are resolved following strict precedence:
+Preflight executes a strict 7-stage candidate recommendation pipeline:
 
 ```text
- 1. User Overrides (Explicit environment variables / notebook parameters)
-         ↓
- 2. Model Metadata (Hugging Face Hub API, config.json, quantization_config)
-         ↓
- 3. Hardware-Safe Defaults (Dual Tesla T4 CC 7.5: float16, enforce-eager, TP=2)
-         ↓
- 4. Final Generated `vllm serve` Command
+[Stage 1: Model Facts Discovery]
+  Extracts native param count, native context length, native dtype, quantization,
+  modalities, architectures, attention dimensions (layers, heads, kv_heads, head_dim),
+  and vision config from Hugging Face Hub config.json & API.
+        ↓
+[Stage 2: Candidate Serving Context]
+  Distinguishes native context from serving context.
+  Bounds native context to min(native_context, 4096).
+  Uses safe candidate fallback 2048 with warning if native context is unknown.
+        ↓
+[Stage 3: Memory Footprint Estimation]
+  Exposes every estimated component with {value, unit, source, confidence, warning}:
+  - M_weights (precision / quantization bytes per param)
+  - M_visual (derived from vision_config or heuristic ~1.0 GB with warning)
+  - M_kv (calculated from transformer attention dimensions or heuristic)
+  - M_cuda_runtime (1.0 GB fixed headroom per GPU)
+        ↓
+[Stage 4: Candidate TP Evaluation & Fit Check]
+  Calculates single-GPU workload: M_weights + M_visual + M_cuda + M_kv.
+  - If fits on 1 GPU (<= 85% VRAM): recommends TP=1.
+  - Else if 2 GPUs available: evaluates TP=2 (visual replicated, KV sharded if kv_heads >= 2).
+    If fits (<= 92% VRAM): recommends TP=2.
+    If exceeds: rejects with capacity error.
+  - (If no GPU detected: marks UNKNOWN_NO_GPU and evaluates reference dual T4 profile).
+        ↓
+[Stage 5: Utilization Calculation vs Deployment Policy Bounds]
+  Calculates raw target utilization: (per-GPU memory required) / per_gpu_vram.
+  Applies deployment policy clamp [0.70, 0.92]. Exposes both raw and clamped values.
+        ↓
+[Stage 6: vLLM Version Compatibility Check]
+  Checks architecture against known minimum vLLM requirements registry.
+  If unknown, reports UNKNOWN and requires runtime validation.
+        ↓
+[Stage 7: Candidate Decisions Assembly]
+  Assembles explainable decision objects: {value, source, rationale, confidence, warning}.
+  User overrides take strict precedence (source: "user_override").
+  Sets validation_status = "CANDIDATE_RECOMMENDED" with startup verification advisory.
 ```
 
 ---
