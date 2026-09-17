@@ -247,4 +247,49 @@ describe('ModelRouter', () => {
     expect(plan4).not.toBe(plan3);
     expect(plan4.primary.modelInfo.id).toBe('qwen3-coder-30b');
   });
+
+  it('allows same model ID across different providers as valid fallback target', () => {
+    const registry = setupRegistry();
+    // Register a secondary provider that also offers "qwen3-coder-30b"
+    const backupProvider = {
+      id: 'backup-vllm',
+      name: 'Backup vLLM',
+      getCapabilities: () => ({
+        supportsStreaming: true,
+        supportsToolCalling: false,
+        supportsVision: false,
+        supportsStructuredOutput: false,
+        maxContextTokens: 32768,
+        maxOutputTokens: 4096,
+      }),
+      healthCheck: async () => ({ isHealthy: true, latencyMs: 10, lastChecked: new Date() }),
+      chat: async () => ({}) as any,
+      chatStream: async function* () {},
+    };
+    registry.registerProvider(backupProvider);
+    registry.registerModel({
+      id: 'qwen3-coder-30b',
+      name: 'Backup Qwen Coder',
+      provider: 'backup-vllm',
+      capabilities: backupProvider.getCapabilities(),
+    });
+
+    const router = new ModelRouter({
+      registry,
+      policies: [
+        {
+          model: 'qwen-redundant',
+          primary: 'qwen/qwen3-coder-30b',
+          fallbacks: ['backup-vllm/qwen3-coder-30b'],
+        },
+      ],
+    });
+
+    const plan = router.resolvePlan('qwen-redundant');
+    expect(plan.primary.provider.id).toBe('qwen');
+    expect(plan.primary.modelInfo.id).toBe('qwen3-coder-30b');
+    expect(plan.fallbacks).toHaveLength(1);
+    expect(plan.fallbacks[0]!.provider.id).toBe('backup-vllm');
+    expect(plan.fallbacks[0]!.modelInfo.id).toBe('qwen3-coder-30b');
+  });
 });

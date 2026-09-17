@@ -138,7 +138,7 @@ diag_vllm() {
   echo "========================================================"
   if ! command -v vllm >/dev/null 2>&1; then
     echo "[FAIL] vLLM CLI not found."
-    echo "  Remediation: Run 'pip install -q --no-cache-dir vllm'."
+    echo "  Remediation: Run 'pip install -q --no-cache-dir vllm==0.29.0'."
     return 1
   fi
 

@@ -105,6 +105,17 @@ const optionalHttpUrlString = z.preprocess(
   httpUrlSchema.optional(),
 );
 
+const AdditionalProviderItemSchema = z.object({
+  id: z.string().trim().min(1, 'Provider id must not be empty'),
+  name: z.string().trim().min(1).optional(),
+  baseUrl: httpUrlSchema,
+  apiKey: optionalTrimmedString,
+  models: z
+    .array(z.string().trim().min(1, 'Model id must not be empty'))
+    .min(1, 'Provider must define at least one model')
+    .optional(),
+});
+
 export const EnvironmentSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   HOST: z.string().default('0.0.0.0'),
@@ -156,6 +167,7 @@ export const EnvironmentSchema = z.object({
     (val) => val === 'true' || val === true || val === '1',
     z.boolean().default(false),
   ),
+  CORS_ORIGINS: optionalTrimmedString,
 
   // Model Routing & Fallback Policies (JSON format)
   ROUTING_POLICIES: optionalTrimmedString,
@@ -297,35 +309,46 @@ export function loadConfig(
   }
 
   if (env.ADDITIONAL_PROVIDERS) {
+    let parsedBackends: unknown;
     try {
-      const parsedBackends = JSON.parse(env.ADDITIONAL_PROVIDERS);
-      if (Array.isArray(parsedBackends)) {
-        for (const b of parsedBackends) {
-          if (b && typeof b.id === 'string' && typeof b.baseUrl === 'string') {
-            const models = Array.isArray(b.models)
-              ? b.models.filter((m: unknown) => typeof m === 'string')
-              : [b.id];
-            const backend: {
-              id: string;
-              name: string;
-              baseUrl: string;
-              apiKey?: string;
-              models: readonly string[];
-            } = {
-              id: b.id,
-              name: typeof b.name === 'string' ? b.name : b.id,
-              baseUrl: b.baseUrl,
-              models,
-            };
-            if (typeof b.apiKey === 'string') {
-              backend.apiKey = b.apiKey;
-            }
-            openAiCompatibleBackends.push(backend);
-          }
-        }
-      }
+      parsedBackends = JSON.parse(env.ADDITIONAL_PROVIDERS);
     } catch {
       throw new Error('Invalid JSON format in ADDITIONAL_PROVIDERS environment variable.');
+    }
+
+    if (!Array.isArray(parsedBackends)) {
+      throw new Error('ADDITIONAL_PROVIDERS must be a JSON array of provider configurations.');
+    }
+
+    const seenIds = new Set<string>(openAiCompatibleBackends.map((b) => b.id));
+    if (env.GEMINI_API_KEY) {
+      seenIds.add('gemini');
+    }
+
+    for (const rawItem of parsedBackends) {
+      const parseResult = AdditionalProviderItemSchema.safeParse(rawItem);
+      if (!parseResult.success) {
+        const issues = parseResult.error.issues
+          .map((i) => `${i.path.join('.')}: ${i.message}`)
+          .join(', ');
+        throw new Error(`Invalid provider in ADDITIONAL_PROVIDERS: ${issues}`);
+      }
+
+      const item = parseResult.data;
+      if (seenIds.has(item.id)) {
+        throw new Error(
+          `Duplicate provider id "${item.id}" in ADDITIONAL_PROVIDERS or built-in providers.`,
+        );
+      }
+      seenIds.add(item.id);
+
+      openAiCompatibleBackends.push({
+        id: item.id,
+        name: item.name ?? item.id,
+        baseUrl: item.baseUrl,
+        ...(item.apiKey ? { apiKey: item.apiKey } : {}),
+        models: item.models ?? [item.id],
+      });
     }
   }
 

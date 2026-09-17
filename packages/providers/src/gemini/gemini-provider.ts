@@ -11,7 +11,11 @@ import type {
   RequestOptions,
   ToolCall,
 } from '@relay/core';
-import { RelayProviderUnavailableError, RelayTimeoutError } from '@relay/core';
+import {
+  RelayProviderUnavailableError,
+  RelayRequestCancelledError,
+  RelayTimeoutError,
+} from '@relay/core';
 import { mapHttpStatusToRelayError } from '../http/error-mapper.js';
 import { parseServerSentEvents } from '../http/sse-parser.js';
 
@@ -70,9 +74,12 @@ export class GeminiProvider implements LLMProvider {
     const timer = setTimeout(() => controller.abort(), 5000);
 
     try {
-      const url = `${this.baseUrl}/${this.apiVersion}/models?key=${this.apiKey}`;
+      const url = `${this.baseUrl}/${this.apiVersion}/models`;
       const response = await fetch(url, {
         method: 'GET',
+        headers: {
+          'x-goog-api-key': this.apiKey,
+        },
         signal: controller.signal,
       });
 
@@ -108,7 +115,7 @@ export class GeminiProvider implements LLMProvider {
     options?: RequestOptions,
   ): Promise<ChatCompletionResponse> {
     const model = this.sanitizeModelName(request.model);
-    const url = `${this.baseUrl}/${this.apiVersion}/models/${model}:generateContent?key=${this.apiKey}`;
+    const url = `${this.baseUrl}/${this.apiVersion}/models/${model}:generateContent`;
     const payload = this.transformRequest(request);
 
     let response: Response;
@@ -117,6 +124,7 @@ export class GeminiProvider implements LLMProvider {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
           ...(options?.headers ?? {}),
         },
         body: JSON.stringify(payload),
@@ -127,7 +135,7 @@ export class GeminiProvider implements LLMProvider {
 
       response = await fetch(url, requestInit);
     } catch (err) {
-      this.handleFetchError(err);
+      this.handleFetchError(err, options?.signal);
     }
 
     if (!response.ok) {
@@ -157,7 +165,7 @@ export class GeminiProvider implements LLMProvider {
     options?: RequestOptions,
   ): AsyncIterable<ChatCompletionChunk> {
     const model = this.sanitizeModelName(request.model);
-    const url = `${this.baseUrl}/${this.apiVersion}/models/${model}:streamGenerateContent?alt=sse&key=${this.apiKey}`;
+    const url = `${this.baseUrl}/${this.apiVersion}/models/${model}:streamGenerateContent?alt=sse`;
     const payload = this.transformRequest(request);
 
     let response: Response;
@@ -166,6 +174,7 @@ export class GeminiProvider implements LLMProvider {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
           ...(options?.headers ?? {}),
         },
         body: JSON.stringify(payload),
@@ -176,7 +185,7 @@ export class GeminiProvider implements LLMProvider {
 
       response = await fetch(url, requestInit);
     } catch (err) {
-      this.handleFetchError(err);
+      this.handleFetchError(err, options?.signal);
     }
 
     if (!response.ok) {
@@ -426,11 +435,16 @@ export class GeminiProvider implements LLMProvider {
     }
   }
 
-  private handleFetchError(err: unknown): never {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new RelayTimeoutError('Request was aborted or timed out', { cause: err });
-    }
-    if (err instanceof Error && err.name === 'AbortError') {
+  private handleFetchError(err: unknown, signal?: AbortSignal): never {
+    if (
+      (err instanceof DOMException && err.name === 'AbortError') ||
+      (err instanceof Error && err.name === 'AbortError')
+    ) {
+      if (signal?.reason === 'client_disconnect' || signal?.reason === 'cancelled') {
+        throw new RelayRequestCancelledError('Client disconnected or request was cancelled', {
+          cause: err,
+        });
+      }
       throw new RelayTimeoutError('Request was aborted or timed out', { cause: err });
     }
     const isNetworkError =

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { RelayProviderUnavailableError, RelayRateLimitError } from '@relay/core';
+import {
+  RelayProviderUnavailableError,
+  RelayRateLimitError,
+  RelayRequestCancelledError,
+} from '@relay/core';
 import { ProviderRegistry } from '@relay/providers';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config/index.js';
@@ -241,6 +245,40 @@ describe('POST /v1/chat/completions', () => {
     expect(response.statusCode).toBe(504);
     const body = JSON.parse(response.body);
     expect(body.error.code).toBe('request_timeout');
+  });
+
+  it('returns 499 Request Cancelled when client aborts or cancels', async () => {
+    const config = loadConfig({ LOG_LEVEL: 'silent' });
+    const registry = new ProviderRegistry();
+    const mockProvider = new TestMockProvider('mock-provider');
+    mockProvider.shouldFailWith = new RelayRequestCancelledError('Client disconnected');
+
+    registry.registerProvider(mockProvider);
+    registry.registerModel({
+      id: 'mock-model',
+      name: 'Mock Model',
+      provider: 'mock-provider',
+      capabilities: mockProvider.getCapabilities('mock-model'),
+    });
+
+    const app = await createApp({
+      config,
+      registry,
+      serverOptions: { logger: false },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(499);
+    const body = JSON.parse(response.body);
+    expect(body.error.code).toBe('cancelled');
   });
 
   it('propagates pre-stream errors with correct HTTP status instead of 200 SSE', async () => {

@@ -225,12 +225,12 @@ Because `WORK_DIR` defaults to `/kaggle/working`, all operational logs and PIDs 
 
 ## Troubleshooting Quick Reference
 
-| Issue                              | Diagnostic / Remediation                                                                      |
-| :--------------------------------- | :-------------------------------------------------------------------------------------------- |
-| **`vllm` not found**               | Run the `Install vLLM` prerequisite above, then verify with `!vllm --version`.                |
-| **GPU out of memory**              | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                               |
-| **Port 8000 occupied**             | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                       |
-| **Weights still loading**          | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`.       |
-| **Tunnel URL missing**             | Run `./infra/kaggle/cloudflared.sh logs 30`.                                                   |
-| **Full Stack Health**              | Run `./infra/kaggle/diagnostics.sh all`.                                                       |
-| **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell.              |
+| Issue                              | Diagnostic / Remediation                                                                |
+| :--------------------------------- | :-------------------------------------------------------------------------------------- |
+| **`vllm` not found**               | Run the `Install vLLM` prerequisite above, then verify with `!vllm --version`.          |
+| **GPU out of memory**              | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                        |
+| **Port 8000 occupied**             | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                |
+| **Weights still loading**          | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`. |
+| **Tunnel URL missing**             | Run `./infra/kaggle/cloudflared.sh logs 30`.                                            |
+| **Full Stack Health**              | Run `./infra/kaggle/diagnostics.sh all`.                                                |
+| **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell.        |

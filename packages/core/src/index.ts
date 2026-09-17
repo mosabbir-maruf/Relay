@@ -36,9 +36,11 @@ export {
   RelayInvalidRequestError,
   RelayProviderUnavailableError,
   RelayRateLimitError,
+  RelayRequestCancelledError,
   RelayTimeoutError,
   isRateLimitError,
   isRelayError,
+  isRequestCancelledError,
 } from './errors/relay-error.js';
 
 export type {

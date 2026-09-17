@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { RelayInvalidRequestError, RelayRateLimitError } from '@relay/core';
+import {
+  RelayInvalidRequestError,
+  RelayRateLimitError,
+  RelayRequestCancelledError,
+  RelayTimeoutError,
+} from '@relay/core';
 import { GeminiProvider } from '../src/gemini/gemini-provider.js';
 
 describe('GeminiProvider', () => {
@@ -60,11 +65,15 @@ describe('GeminiProvider', () => {
     expect(result.usage.completionTokens).toBe(8);
     expect(result.usage.totalTokens).toBe(23);
 
-    // Verify Gemini payload structure
+    // Verify Gemini payload structure and header auth
     const fetchCall = (globalThis.fetch as any).mock.calls[0];
     const url = fetchCall[0];
     const options = fetchCall[1];
-    expect(url).toContain('gemini-1.5-flash:generateContent?key=gemini-test-key');
+    expect(url).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent',
+    );
+    expect(url).not.toContain('key=');
+    expect(options.headers['x-goog-api-key']).toBe('gemini-test-key');
 
     const sentBody = JSON.parse(options.body);
     expect(sentBody.systemInstruction.parts[0].text).toBe('You are a helpful assistant.');
@@ -192,5 +201,79 @@ describe('GeminiProvider', () => {
     expect(chunks[1]?.delta.content).toBe(' world');
     expect(chunks[1]?.finishReason).toBe('stop');
     expect(chunks[1]?.usage?.totalTokens).toBe(7);
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    expect(fetchCall[0]).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse',
+    );
+    expect(fetchCall[0]).not.toContain('key=');
+    expect(fetchCall[1].headers['x-goog-api-key']).toBe('test-key');
+  });
+
+  it('uses x-goog-api-key header and no query key in healthCheck', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ models: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new GeminiProvider({
+      apiKey: 'health-test-key',
+    });
+
+    const health = await provider.healthCheck();
+    expect(health.isHealthy).toBe(true);
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    expect(fetchCall[0]).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+    expect(fetchCall[0]).not.toContain('key=');
+    expect(fetchCall[1].headers['x-goog-api-key']).toBe('health-test-key');
+  });
+
+  it('throws RelayRequestCancelledError when signal is aborted with client_disconnect', async () => {
+    const controller = new AbortController();
+    controller.abort('client_disconnect');
+
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+
+    const provider = new GeminiProvider({
+      apiKey: 'test-key',
+    });
+
+    await expect(
+      provider.chat(
+        {
+          model: 'gemini-1.5-flash',
+          messages: [{ role: 'user', content: 'test' }],
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(RelayRequestCancelledError);
+  });
+
+  it('throws RelayTimeoutError when signal is aborted with timeout or standard AbortError', async () => {
+    const controller = new AbortController();
+    controller.abort('request_timeout');
+
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+
+    const provider = new GeminiProvider({
+      apiKey: 'test-key',
+    });
+
+    await expect(
+      provider.chat(
+        {
+          model: 'gemini-1.5-flash',
+          messages: [{ role: 'user', content: 'test' }],
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(RelayTimeoutError);
   });
 });

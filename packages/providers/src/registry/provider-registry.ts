@@ -6,6 +6,11 @@ export interface ModelProviderBinding {
   readonly modelInfo: ModelInfo;
 }
 
+export interface ProviderRegistryOptions {
+  readonly healthCacheTtlMs?: number;
+  readonly minForceRefreshIntervalMs?: number;
+}
+
 /**
  * In-memory registry for LLM providers and model mappings.
  * Maps model IDs to concrete provider implementations without hardcoding.
@@ -20,8 +25,14 @@ export class ProviderRegistry {
   private cachedHealth: Record<string, ProviderHealth> | null = null;
   private inFlightHealthCheck: Promise<Record<string, ProviderHealth>> | null = null;
   private lastHealthCheckTime = 0;
-  private readonly healthCacheTtlMs = 15000;
+  private readonly healthCacheTtlMs: number;
+  private readonly minForceRefreshIntervalMs: number;
   private registryVersion = 0;
+
+  constructor(options?: ProviderRegistryOptions) {
+    this.healthCacheTtlMs = options?.healthCacheTtlMs ?? 15000;
+    this.minForceRefreshIntervalMs = options?.minForceRefreshIntervalMs ?? 0;
+  }
 
   getVersion(): number {
     return this.registryVersion;
@@ -124,10 +135,17 @@ export class ProviderRegistry {
     return Array.from(unique.values());
   }
 
-  async healthCheck(options?: { forceRefresh?: boolean }): Promise<Record<string, ProviderHealth>> {
+  async healthCheck(options?: {
+    forceRefresh?: boolean;
+    minIntervalMs?: number;
+  }): Promise<Record<string, ProviderHealth>> {
     const now = Date.now();
+    const minInterval = options?.minIntervalMs ?? this.minForceRefreshIntervalMs;
+    const isWithinDebounce =
+      minInterval > 0 && this.cachedHealth !== null && now - this.lastHealthCheckTime < minInterval;
+
     if (
-      !options?.forceRefresh &&
+      (!options?.forceRefresh || isWithinDebounce) &&
       this.cachedHealth &&
       now - this.lastHealthCheckTime < this.healthCacheTtlMs
     ) {

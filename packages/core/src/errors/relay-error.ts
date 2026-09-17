@@ -22,6 +22,7 @@ export interface RelayErrorOptions {
  * and standard serialization methods.
  */
 export abstract class RelayError extends Error {
+  readonly isRelayError = true;
   abstract readonly code: string;
   abstract readonly statusCode: number;
   readonly details?: Record<string, unknown>;
@@ -120,15 +121,42 @@ export class RelayProviderUnavailableError extends RelayError {
 }
 
 /**
+ * 499 Request Cancelled: Client aborted or closed the connection before completion.
+ */
+export class RelayRequestCancelledError extends RelayError {
+  readonly code = 'cancelled';
+  readonly statusCode = 499;
+}
+
+/**
  * Type guard to check if an unknown error is an instance of RelayError.
  */
 export function isRelayError(error: unknown): error is RelayError {
-  return error instanceof RelayError;
+  return (
+    error instanceof RelayError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      'isRelayError' in error &&
+      (error as { isRelayError: unknown }).isRelayError === true)
+  );
 }
 
 /**
  * Type guard to check if an unknown error is a RelayRateLimitError.
  */
 export function isRateLimitError(error: unknown): error is RelayRateLimitError {
-  return error instanceof RelayRateLimitError;
+  return (
+    error instanceof RelayRateLimitError ||
+    (isRelayError(error) && error.code === 'rate_limit_exceeded')
+  );
+}
+
+/**
+ * Type guard to check if an unknown error is a RelayRequestCancelledError.
+ */
+export function isRequestCancelledError(error: unknown): error is RelayRequestCancelledError {
+  return (
+    error instanceof RelayRequestCancelledError ||
+    (isRelayError(error) && error.code === 'cancelled')
+  );
 }

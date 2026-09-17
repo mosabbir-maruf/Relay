@@ -19,6 +19,7 @@ BIN_PATH="${WORK_DIR}/cloudflared"
 LOG_FILE="${WORK_DIR}/cloudflared.log"
 PID_FILE="${WORK_DIR}/cloudflared.pid"
 LOCAL_TARGET="${LOCAL_TARGET:-http://127.0.0.1:8000}"
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 
 ensure_binary() {
   if [ -x "${BIN_PATH}" ]; then
@@ -27,9 +28,15 @@ ensure_binary() {
     return 0
   fi
 
-  echo "cloudflared binary not found at ${BIN_PATH}. Downloading official release..."
+  echo "cloudflared binary not found at ${BIN_PATH}. Downloading official release (version: ${CLOUDFLARED_VERSION})..."
   mkdir -p "${WORK_DIR}"
-  wget -q -nc "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -O "${BIN_PATH}"
+  local download_url
+  if [ "${CLOUDFLARED_VERSION}" = "latest" ]; then
+    download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+  else
+    download_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+  fi
+  wget -q -nc "${download_url}" -O "${BIN_PATH}"
   chmod +x "${BIN_PATH}"
   echo "Downloaded and marked executable:"
   "${BIN_PATH}" --version

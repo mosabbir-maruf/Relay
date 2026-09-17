@@ -115,12 +115,12 @@ describe('Multi-Provider Gateway Integration (Gemini + OpenAI-Compatible)', () =
       expect(data.choices[0].finish_reason).toBe('stop');
       expect(data.usage.total_tokens).toBe(15);
 
-      // Verify Gemini mock server received the request with query key
+      // Verify Gemini mock server received the request with header auth (no key in URL)
       expect(mockGeminiServer.recordedRequests).toHaveLength(1);
       const req = mockGeminiServer.recordedRequests[0]!;
-      expect(req.url).toContain(
-        '/v1beta/models/gemini-2.5-flash:generateContent?key=test-gemini-key',
-      );
+      expect(req.url).toContain('/v1beta/models/gemini-2.5-flash:generateContent');
+      expect(req.url).not.toContain('key=');
+      expect(req.headers['x-goog-api-key']).toBe('test-gemini-key');
       expect(req.body.contents[0].parts[0].text).toBe('Say hello from Gemini');
 
       // OpenAI mock server should NOT have received anything

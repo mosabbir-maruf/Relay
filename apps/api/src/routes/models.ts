@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+import { RelayInvalidRequestError } from '@relay/core';
 import type { ModelRouter, ProviderRegistry } from '@relay/providers';
 
 export interface ModelsRoutesOptions {
@@ -44,8 +45,21 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
       });
     });
 
-    app.get<{ Params: { model: string } }>('/v1/models/:model', async (request, reply) => {
-      const { model } = request.params;
+    app.get<{ Params: { '*': string } }>('/v1/models/*', async (request, reply) => {
+      const rawModel = request.params['*'] ?? '';
+      const model = decodeURIComponent(rawModel).trim();
+
+      if (!model) {
+        return reply.status(400).send({
+          error: {
+            message: 'Model parameter cannot be empty.',
+            type: 'invalid_request_error',
+            param: 'model',
+            code: 'invalid_request',
+          },
+        });
+      }
+
       try {
         if (options.router) {
           const plan = options.router.resolvePlan(model);
@@ -58,15 +72,29 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
           });
         }
 
-        const { modelInfo } = options.registry.getProviderForModel(model);
+        const { modelInfo, provider } = options.registry.getProviderForModel(model);
         return reply.status(200).send({
-          id: modelInfo.id,
+          id: model,
           object: 'model',
           created: modelInfo.created ?? 1726500000,
-          owned_by: modelInfo.provider,
+          owned_by: provider.id,
           capabilities: modelInfo.capabilities,
         });
-      } catch {
+      } catch (err) {
+        if (
+          err instanceof RelayInvalidRequestError &&
+          err.message.toLowerCase().includes('ambiguous')
+        ) {
+          return reply.status(400).send({
+            error: {
+              message: err.message,
+              type: 'invalid_request_error',
+              param: 'model',
+              code: 'ambiguous_model',
+            },
+          });
+        }
+
         return reply.status(404).send({
           error: {
             message: `The model '${model}' does not exist or is not configured.`,

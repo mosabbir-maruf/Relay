@@ -96,7 +96,6 @@ export class ModelRouter implements RoutingPolicy {
     // Mark primary target as seen to prevent duplicate execution
     const primaryKey = `${primaryBinding.provider.id}/${primaryBinding.modelInfo.id}`;
     seenTargets.add(primaryKey);
-    seenTargets.add(primaryBinding.modelInfo.id);
 
     if (initialRule?.fallbacks && Array.isArray(initialRule.fallbacks)) {
       for (const fallbackModelName of initialRule.fallbacks) {
@@ -111,12 +110,11 @@ export class ModelRouter implements RoutingPolicy {
           const targetKey = `${binding.provider.id}/${binding.modelInfo.id}`;
 
           // Avoid duplicate provider attempts and self-cycles
-          if (seenTargets.has(targetKey) || seenTargets.has(binding.modelInfo.id)) {
+          if (seenTargets.has(targetKey)) {
             continue;
           }
 
           seenTargets.add(targetKey);
-          seenTargets.add(binding.modelInfo.id);
           fallbackBindings.push(binding);
           fallbackTargets.push({
             provider: binding.provider.id,

@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { RelayAuthenticationError, RelayRateLimitError } from '@relay/core';
+import {
+  RelayAuthenticationError,
+  RelayRateLimitError,
+  RelayRequestCancelledError,
+  RelayTimeoutError,
+} from '@relay/core';
 import { OpenAICompatibleProvider } from '../src/openai-compatible/openai-compatible-provider.js';
 
 describe('OpenAICompatibleProvider', () => {
@@ -219,5 +224,51 @@ describe('OpenAICompatibleProvider', () => {
     // Verify payload preserved full namespaced model ID
     const sentBody = JSON.parse(fetchCall[1].body);
     expect(sentBody.model).toBe('Qwen/Qwen2.5-Coder-7B-Instruct');
+  });
+
+  it('throws RelayRequestCancelledError when signal is aborted with client_disconnect', async () => {
+    const controller = new AbortController();
+    controller.abort('client_disconnect');
+
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: 'http://localhost:8000/v1',
+    });
+
+    await expect(
+      provider.chat(
+        {
+          model: 'qwen',
+          messages: [{ role: 'user', content: 'test' }],
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(RelayRequestCancelledError);
+  });
+
+  it('throws RelayTimeoutError when signal is aborted with request_timeout', async () => {
+    const controller = new AbortController();
+    controller.abort('request_timeout');
+
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new DOMException('The operation was aborted', 'AbortError'));
+
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: 'http://localhost:8000/v1',
+    });
+
+    await expect(
+      provider.chat(
+        {
+          model: 'qwen',
+          messages: [{ role: 'user', content: 'test' }],
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(RelayTimeoutError);
   });
 });

@@ -152,7 +152,7 @@ After cloning, all scripts reside at `/kaggle/working/Relay/infra/kaggle/*.sh`.
 - **Where**: Kaggle Notebook / Terminal (`/kaggle/working/Relay`).
 - **How**:
   ```bash
-  pip install -q --no-cache-dir vllm
+  pip install -q --no-cache-dir "vllm==0.29.0"
   ./infra/kaggle/qwen-vllm.sh check
   ```
 - **Where the file is**: `/kaggle/working/Relay/infra/kaggle/qwen-vllm.sh`

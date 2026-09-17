@@ -139,7 +139,7 @@ start_server() {
   # Check if vllm is installed
   if ! command -v vllm >/dev/null 2>&1; then
     echo "ERROR: 'vllm' binary not found on PATH." >&2
-    echo "Remediation: pip install -q --no-cache-dir vllm" >&2
+    echo "Remediation: pip install -q --no-cache-dir vllm==0.29.0" >&2
     return 1
   fi
 

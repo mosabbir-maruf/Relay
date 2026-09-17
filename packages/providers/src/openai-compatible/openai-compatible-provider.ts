@@ -13,7 +13,11 @@ import type {
   RequestOptions,
   ToolCall,
 } from '@relay/core';
-import { RelayProviderUnavailableError, RelayTimeoutError } from '@relay/core';
+import {
+  RelayProviderUnavailableError,
+  RelayRequestCancelledError,
+  RelayTimeoutError,
+} from '@relay/core';
 import { mapHttpStatusToRelayError } from '../http/error-mapper.js';
 import { parseServerSentEvents } from '../http/sse-parser.js';
 
@@ -124,7 +128,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
       response = await fetch(`${this.baseUrl}/chat/completions`, requestInit);
     } catch (err) {
-      this.handleFetchError(err);
+      this.handleFetchError(err, options?.signal);
     }
 
     if (!response.ok) {
@@ -169,7 +173,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
       response = await fetch(`${this.baseUrl}/chat/completions`, requestInit);
     } catch (err) {
-      this.handleFetchError(err);
+      this.handleFetchError(err, options?.signal);
     }
 
     if (!response.ok) {
@@ -357,11 +361,16 @@ export class OpenAICompatibleProvider implements LLMProvider {
     };
   }
 
-  private handleFetchError(err: unknown): never {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new RelayTimeoutError('Request was aborted or timed out', { cause: err });
-    }
-    if (err instanceof Error && err.name === 'AbortError') {
+  private handleFetchError(err: unknown, signal?: AbortSignal): never {
+    if (
+      (err instanceof DOMException && err.name === 'AbortError') ||
+      (err instanceof Error && err.name === 'AbortError')
+    ) {
+      if (signal?.reason === 'client_disconnect' || signal?.reason === 'cancelled') {
+        throw new RelayRequestCancelledError('Client disconnected or request was cancelled', {
+          cause: err,
+        });
+      }
       throw new RelayTimeoutError('Request was aborted or timed out', { cause: err });
     }
     const isNetworkError =

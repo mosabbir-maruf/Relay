@@ -90,8 +90,14 @@ export async function createApp(options: AppFactoryOptions): Promise<FastifyInst
   });
 
   // Enable CORS
+  const corsOrigin = options.config.env.CORS_ORIGINS
+    ? options.config.env.CORS_ORIGINS.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : true;
+
   await app.register(cors, {
-    origin: true,
+    origin: corsOrigin,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   });
 
@@ -113,6 +119,7 @@ export async function createApp(options: AppFactoryOptions): Promise<FastifyInst
     const normalizedPath = getNormalizedPath(request.url);
     if (
       normalizedPath === '/health' ||
+      normalizedPath.startsWith('/health/') ||
       normalizedPath === '/playground' ||
       normalizedPath.startsWith('/playground/')
     ) {

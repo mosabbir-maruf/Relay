@@ -33,6 +33,10 @@ export function resolveRateLimitKey(
     return `client:${tokenHash}`;
   }
 
+  if (strategy === 'client_only') {
+    return 'client:anonymous';
+  }
+
   return `ip:${ip}`;
 }
 
@@ -51,7 +55,7 @@ export function createRateLimitHook(options: RateLimitHookOptions) {
     const normalizedPath = getNormalizedPath(request.url);
 
     // Exempt operational health check endpoints from rate limiting
-    if (normalizedPath === '/health') {
+    if (normalizedPath === '/health' || normalizedPath.startsWith('/health/')) {
       return;
     }
 

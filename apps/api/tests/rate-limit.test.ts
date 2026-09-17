@@ -573,4 +573,39 @@ describe('Relay Rate Limiting Foundation', () => {
       expect(res.headers['x-ratelimit-limit']).toBeUndefined();
     }
   });
+
+  it('uses client:anonymous when client_only strategy is used without token', async () => {
+    let mockTime = 1_000_000;
+    const { create } = setupTestApp({
+      maxRequests: 1,
+      windowMs: 60_000,
+      keyStrategy: 'client_only',
+      getTime: () => mockTime,
+    });
+    const app = await create();
+
+    // First unauthenticated request from IP 1
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      remoteAddress: '10.0.0.1',
+      payload: {
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'Hi' }],
+      },
+    });
+    expect(res1.statusCode).toBe(200);
+
+    // Second unauthenticated request from DIFFERENT IP 2 is blocked because both share client:anonymous
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      remoteAddress: '10.0.0.2',
+      payload: {
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'Hi' }],
+      },
+    });
+    expect(res2.statusCode).toBe(429);
+  });
 });

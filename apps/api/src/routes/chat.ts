@@ -16,9 +16,11 @@ import {
   NoopCircuitBreaker,
   RelayInvalidRequestError,
   RelayProviderUnavailableError,
+  RelayRequestCancelledError,
   RelayTimeoutError,
   isCircuitBreakerFailure,
   isRelayError,
+  isRequestCancelledError,
   isRetryableError,
 } from '@relay/core';
 import { writeSseStream, type SseStreamResult } from '../sse/sse-writer.js';
@@ -63,12 +65,12 @@ export function createChatRoutes(options: ChatRoutesOptions): FastifyPluginAsync
 
       const timer = setTimeout(() => {
         timedOut = true;
-        controller.abort();
+        controller.abort('request_timeout');
       }, options.requestTimeoutMs);
 
       const onSocketClose = () => {
         if (!reply.raw.writableEnded) {
-          controller.abort();
+          controller.abort('client_disconnect');
         }
       };
       request.raw.on('close', onSocketClose);
@@ -356,10 +358,14 @@ export function createChatRoutes(options: ChatRoutesOptions): FastifyPluginAsync
         let statusCode = 500;
         let errorCategory = 'internal_error';
 
+        const isClientCancelled =
+          !timedOut &&
+          (controller.signal.reason === 'client_disconnect' || isRequestCancelledError(err));
+
         if (timedOut) {
           statusCode = 504;
           errorCategory = 'request_timeout';
-        } else if (controller.signal.aborted) {
+        } else if (isClientCancelled) {
           statusCode = 499;
           errorCategory = 'cancelled';
         } else if (isRelayError(err)) {
@@ -388,6 +394,11 @@ export function createChatRoutes(options: ChatRoutesOptions): FastifyPluginAsync
               cause: err,
             },
           );
+        }
+        if (isClientCancelled && !isRequestCancelledError(err)) {
+          throw new RelayRequestCancelledError('Client disconnected or request was cancelled.', {
+            cause: err,
+          });
         }
         throw err;
       } finally {
