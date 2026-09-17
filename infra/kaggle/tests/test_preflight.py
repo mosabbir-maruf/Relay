@@ -1268,6 +1268,64 @@ MODEL=gpt2
         self.assertEqual(data["data"][0]["id"], "gpt2")
         self.assertEqual(mock_urlopen.call_count, 2)
 
+    def test_clean_tunnel_url_markdown_and_wrapper_stripping(self):
+        """Tests that clean_tunnel_url strips Markdown link syntax, brackets, and quotes."""
+        expected = "https://stephanie-nerve-faces-alarm.trycloudflare.com"
+
+        # Plain URL
+        self.assertEqual(preflight.clean_tunnel_url(expected), expected)
+        self.assertEqual(preflight.clean_tunnel_url(expected + "/"), expected)
+        self.assertEqual(preflight.clean_tunnel_url(expected + "/v1"), expected)
+
+        # Markdown links
+        self.assertEqual(
+            preflight.clean_tunnel_url(f"[{expected}]({expected})"),
+            expected,
+        )
+        self.assertEqual(
+            preflight.clean_tunnel_url(f"[Public Tunnel URL]({expected})"),
+            expected,
+        )
+        self.assertEqual(
+            preflight.clean_tunnel_url(f"[{expected}]"),
+            expected,
+        )
+
+        # Angle brackets & quotes
+        self.assertEqual(preflight.clean_tunnel_url(f"<{expected}>"), expected)
+        self.assertEqual(preflight.clean_tunnel_url(f'"{expected}"'), expected)
+        self.assertEqual(preflight.clean_tunnel_url(f"'{expected}'"), expected)
+
+        # None / empty
+        self.assertEqual(preflight.clean_tunnel_url(None), "")
+        self.assertEqual(preflight.clean_tunnel_url(""), "")
+
+    def test_enable_ipv4_dns_fallback(self):
+        """Tests that enable_ipv4_dns_fallback retries AF_UNSPEC gaierror with AF_INET."""
+        import socket
+
+        orig_getaddrinfo = socket.getaddrinfo
+        called_families = []
+
+        def mock_gai(host, port, family=0, type=0, proto=0, flags=0):
+            called_families.append(family)
+            if family == 0:
+                raise socket.gaierror(-2, "Name or service not known")
+            return [("AF_INET", 1, 6, "", ("104.16.132.229", 443))]
+
+        try:
+            socket.getaddrinfo = mock_gai
+            # Reset global flag to allow re-patching in test
+            preflight._ipv4_fallback_enabled = False
+            preflight.enable_ipv4_dns_fallback()
+
+            res = socket.getaddrinfo("test-domain.trycloudflare.com", 443)
+            self.assertEqual(res[0][4][0], "104.16.132.229")
+            self.assertIn(0, called_families)
+            self.assertIn(socket.AF_INET, called_families)
+        finally:
+            socket.getaddrinfo = orig_getaddrinfo
+
 
 if __name__ == "__main__":
     unittest.main()

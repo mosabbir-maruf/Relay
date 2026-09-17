@@ -484,22 +484,82 @@ def resolve_inference_test_plan(
     }
 
 
+def clean_tunnel_url(raw: Optional[str]) -> str:
+    """
+    Normalizes a tunnel URL into a clean, plain URL string:
+    'https://<subdomain>.trycloudflare.com'.
+    Strips any Markdown link formatting (e.g., [text](url) or [url]), brackets,
+    quotes, whitespace, and trailing paths.
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+
+    s = raw.strip().strip("'\"`<>")
+    # If wrapped in markdown link [text](url) -> extract url
+    md_match = re.search(r"\]\((https?://[^\s\)]+)\)", s)
+    if md_match:
+        s = md_match.group(1).strip()
+    else:
+        # If [https://...] -> extract inner
+        bracket_match = re.search(r"\[(https?://[^\s\]]+)\]", s)
+        if bracket_match:
+            s = bracket_match.group(1).strip()
+
+    # Match exact trycloudflare subdomain URL
+    cf_match = re.search(r"(https?)://([a-zA-Z0-9-]+\.trycloudflare\.com)", s, flags=re.IGNORECASE)
+    if cf_match:
+        return f"{cf_match.group(1).lower()}://{cf_match.group(2).lower()}"
+
+    # Generic http/https URL
+    gen_match = re.search(r"(https?)://([a-zA-Z0-9.-]+(?::[0-9]+)?)", s, flags=re.IGNORECASE)
+    if gen_match:
+        return f"{gen_match.group(1).lower()}://{gen_match.group(2).lower()}"
+
+    return s.rstrip("/")
+
+
+_ipv4_fallback_enabled = False
+
+def enable_ipv4_dns_fallback() -> None:
+    """
+    If default socket.getaddrinfo fails on IPv6/dual-stack queries,
+    wraps socket.getaddrinfo to fall back to AF_INET (IPv4).
+    """
+    global _ipv4_fallback_enabled
+    if _ipv4_fallback_enabled:
+        return
+
+    orig_getaddrinfo = socket.getaddrinfo
+
+    def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        try:
+            return orig_getaddrinfo(host, port, family, type, proto, flags)
+        except socket.gaierror:
+            if family == 0:
+                # Retry with IPv4 only
+                return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+            raise
+
+    socket.getaddrinfo = patched_getaddrinfo
+    _ipv4_fallback_enabled = True
+
+
 def validate_tunnel_url(url: Optional[str]) -> Tuple[bool, str]:
     """
     Validates that a tunnel URL is well-formed:
     - Non-empty string
     - Scheme is exactly 'https'
     - Hostname is present, non-empty, and contains at least one dot
-    - No whitespace or invalid control characters
+    - No Markdown brackets, whitespace, or invalid control characters
     - Not localhost, null, or undefined
     Returns (is_valid: bool, error_reason: str).
     """
     if not url or not isinstance(url, str):
         return False, "URL is empty or not a string"
 
-    cleaned = url.strip().strip("'\"")
+    cleaned = clean_tunnel_url(url)
     if not cleaned:
-        return False, "URL is empty after trimming"
+        return False, "URL is empty after cleaning"
 
     try:
         parsed = urllib.parse.urlparse(cleaned)
@@ -517,8 +577,8 @@ def validate_tunnel_url(url: Optional[str]) -> Tuple[bool, str]:
     if "." not in host:
         return False, f"Hostname '{host}' must contain at least one domain separator dot"
 
-    if any(c in host for c in [" ", "\t", "\r", "\n"]):
-        return False, f"Hostname '{host}' contains illegal whitespace"
+    if any(c in host for c in [" ", "\t", "\r", "\n", "[", "]", "(", ")"]):
+        return False, f"Hostname '{host}' contains illegal characters"
 
     if host.lower() in {"none", "null", "undefined", "localhost", "127.0.0.1"}:
         return False, f"Hostname '{host}' is not a valid public tunnel domain"
@@ -544,13 +604,13 @@ def extract_tunnel_url(
     if output_or_text and isinstance(output_or_text, str):
         # Match explicit key-values first
         for pattern in [
-            r"(?:PUBLIC_TUNNEL_URL|PUBLIC_URL)\s*=\s*(https://[^\s\"']+)",
-            r"Public URL:\s*(https://[^\s\"']+)",
+            r"(?:PUBLIC_TUNNEL_URL|PUBLIC_URL)\s*=\s*([^\s\"']+)",
+            r"Public URL:\s*([^\s\"']+)",
             r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)",
         ]:
             matches = re.findall(pattern, output_or_text, flags=re.IGNORECASE)
             for m in reversed(matches):
-                candidates.append(m.strip().rstrip("/"))
+                candidates.append(m.strip())
 
     effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
     url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
@@ -559,7 +619,7 @@ def extract_tunnel_url(
             with open(url_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
             if content:
-                candidates.append(content.rstrip("/"))
+                candidates.append(content)
         except Exception:
             pass
 
@@ -570,21 +630,21 @@ def extract_tunnel_url(
                 log_content = f.read()
             matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", log_content)
             for m in reversed(matches):
-                candidates.append(m.strip().rstrip("/"))
+                candidates.append(m.strip())
         except Exception:
             pass
 
     for env_var in ["PUBLIC_TUNNEL_URL", "PUBLIC_URL"]:
         v = os.environ.get(env_var)
         if v and str(v).strip():
-            candidates.append(str(v).strip().rstrip("/"))
+            candidates.append(str(v).strip())
 
-    # Check candidates in order and return first valid
+    # Check candidates in order and return first valid cleaned URL
     for cand in candidates:
-        cand_clean = cand.strip().strip("'\"").rstrip("/")
-        is_valid, _ = validate_tunnel_url(cand_clean)
+        cleaned = clean_tunnel_url(cand)
+        is_valid, _ = validate_tunnel_url(cleaned)
         if is_valid:
-            return cand_clean
+            return cleaned
 
     return None
 
@@ -599,7 +659,7 @@ def resolve_canonical_tunnel_urls(tunnel_url: Optional[str]) -> Dict[str, str]:
     if not is_valid:
         raise ValueError(f"Invalid Cloudflare tunnel URL ({err}): {repr(tunnel_url)}")
 
-    clean_url = str(tunnel_url).strip().strip("'\"").rstrip("/")
+    clean_url = clean_tunnel_url(tunnel_url)
     return {
         "public_tunnel_url": clean_url,
         "base_url": f"{clean_url}/v1",
@@ -624,10 +684,20 @@ def verify_tunnel_readiness(
     if not is_valid:
         return False, f"Pre-validation failed: {err}", None
 
-    clean_url = str(tunnel_url).strip().strip("'\"").rstrip("/")
+    clean_url = clean_tunnel_url(tunnel_url)
     test_endpoint = f"{clean_url}{target_path}"
     parsed = urllib.parse.urlparse(clean_url)
     hostname = parsed.hostname or clean_url
+
+    # Check DNS resolution early with IPv4 fallback
+    try:
+        socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        try:
+            socket.getaddrinfo(hostname, 443, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
+            enable_ipv4_dns_fallback()
+        except Exception:
+            pass
 
     start_time = time.time()
     last_err: str = "no attempts made"
@@ -654,6 +724,12 @@ def verify_tunnel_readiness(
         except urllib.error.URLError as e:
             if isinstance(e.reason, socket.gaierror) or "Name or service not known" in str(e.reason) or "nodename nor servname" in str(e.reason):
                 last_err = f"DNS lookup pending for {hostname} ({e.reason})"
+                # Try IPv4 fallback dynamically
+                try:
+                    socket.getaddrinfo(hostname, 443, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
+                    enable_ipv4_dns_fallback()
+                except Exception:
+                    pass
             else:
                 last_err = f"Connection error: {e.reason}"
         except Exception as e:

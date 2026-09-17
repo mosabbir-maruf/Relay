@@ -96,8 +96,13 @@ start_tunnel() {
   echo "Starting Cloudflare Quick Tunnel pointing to ${LOCAL_TARGET}..."
   rm -f "${LOG_FILE}" "${PID_FILE}" "${URL_FILE}"
 
-  nohup "${BIN_PATH}" tunnel --url "${LOCAL_TARGET}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${BIN_PATH}" tunnel --url "${LOCAL_TARGET}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
+  else
+    nohup "${BIN_PATH}" tunnel --url "${LOCAL_TARGET}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
+  fi
   local pid=$!
+  disown -a 2>/dev/null || true
   echo "${pid}" > "${PID_FILE}"
   echo "cloudflared process launched (PID ${pid})"
 
