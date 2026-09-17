@@ -62,18 +62,18 @@ The self-service deployment system allows an operator to specify any Hugging Fac
 
 ### 2. Supported Model Classes
 
-| Model Class                        | Parameter Range            | Precision / Quantization     |  Usable on Dual T4?  | Rationale                                                                                                         |
-| :--------------------------------- | :------------------------- | :--------------------------- | :------------------: | :---------------------------------------------------------------------------------------------------------------- |
-| **Small Dense Text Models**        | 0.5B – 3B                  | Unquantized FP16 / BF16      |       **Yes**        | Weights consume 1–6 GB total; fits comfortably on 1 or 2 GPUs.                                                    |
-| **Mid Dense Text Models**          | 7B – 8B                    | Unquantized FP16 / BF16      |       **Yes**        | Weights require ~14–16 GB. With `TP=2`, weights take ~7–8 GB per GPU, leaving ~7 GB for KV cache and activations. |
-| **Large Dense Text Models**        | 13B – 14B                  | Unquantized FP16 / BF16      | **Marginal / Tight** | Weights take ~26–28 GB total. Minimal KV cache headroom remains. Requires small `MAX_MODEL_LEN` (e.g. 2048).      |
-| **Multimodal Vision/OCR Models**   | ~0.9B (e.g. `zai-org/GLM-OCR`) | Unquantized FP16 / BF16      |       **Yes**        | Supported in vLLM. Weights take ~2 GB in FP16 with ~1 GB vision encoder overhead; fits easily on dual T4.         |
-| **Oversized Unquantized**          | > 14B (e.g. 27B, 32B, 70B) | Unquantized FP16             |  **No (Rejected)**   | Weights exceed 30 GB total VRAM. Will crash with Out of Memory (OOM).                                             |
-| **Quantized 4-Bit Models**         | 7B – 14B                   | AWQ or GPTQ 4-bit            |       **Yes**        | Weights take ~4–9 GB total. High throughput and large KV cache headroom.                                          |
-| **Quantized 4-Bit Models**         | 30B – 32B (or MoE)         | AWQ or GPTQ 4-bit            |       **Yes**        | Weights take ~15–18 GB total (~7.5–9 GB per GPU). Fits on dual T4 (e.g., Qwen3-Coder-30B-A3B AWQ).                |
-| **Oversized Quantized**            | > 33B (e.g. 70B AWQ)       | AWQ or GPTQ 4-bit            |  **No (Rejected)**   | Weights require > 35 GB VRAM; exceeds dual T4 capacity.                                                           |
-| **FP8 Models**                     | Any size                   | FP8 (`neuralmagic/`, etc.)   |  **No (Rejected)**   | Tesla T4 lacks hardware FP8 tensor cores.                                                                         |
-| **Non-Causal Models**              | Any size                   | BERT, RoBERTa, CLIP, Whisper |  **No (Rejected)**   | vLLM `serve` is designed for causal autoregressive text and multimodal generative generation.                     |
+| Model Class                      | Parameter Range                | Precision / Quantization     |  Usable on Dual T4?  | Rationale                                                                                                         |
+| :------------------------------- | :----------------------------- | :--------------------------- | :------------------: | :---------------------------------------------------------------------------------------------------------------- |
+| **Small Dense Text Models**      | 0.5B – 3B                      | Unquantized FP16 / BF16      |       **Yes**        | Weights consume 1–6 GB total; fits comfortably on 1 or 2 GPUs.                                                    |
+| **Mid Dense Text Models**        | 7B – 8B                        | Unquantized FP16 / BF16      |       **Yes**        | Weights require ~14–16 GB. With `TP=2`, weights take ~7–8 GB per GPU, leaving ~7 GB for KV cache and activations. |
+| **Large Dense Text Models**      | 13B – 14B                      | Unquantized FP16 / BF16      | **Marginal / Tight** | Weights take ~26–28 GB total. Minimal KV cache headroom remains. Requires small `MAX_MODEL_LEN` (e.g. 2048).      |
+| **Multimodal Vision/OCR Models** | ~0.9B (e.g. `zai-org/GLM-OCR`) | Unquantized FP16 / BF16      |       **Yes**        | Supported in vLLM. Weights take ~2 GB in FP16 with ~1 GB vision encoder overhead; fits easily on dual T4.         |
+| **Oversized Unquantized**        | > 14B (e.g. 27B, 32B, 70B)     | Unquantized FP16             |  **No (Rejected)**   | Weights exceed 30 GB total VRAM. Will crash with Out of Memory (OOM).                                             |
+| **Quantized 4-Bit Models**       | 7B – 14B                       | AWQ or GPTQ 4-bit            |       **Yes**        | Weights take ~4–9 GB total. High throughput and large KV cache headroom.                                          |
+| **Quantized 4-Bit Models**       | 30B – 32B (or MoE)             | AWQ or GPTQ 4-bit            |       **Yes**        | Weights take ~15–18 GB total (~7.5–9 GB per GPU). Fits on dual T4 (e.g., Qwen3-Coder-30B-A3B AWQ).                |
+| **Oversized Quantized**          | > 33B (e.g. 70B AWQ)           | AWQ or GPTQ 4-bit            |  **No (Rejected)**   | Weights require > 35 GB VRAM; exceeds dual T4 capacity.                                                           |
+| **FP8 Models**                   | Any size                       | FP8 (`neuralmagic/`, etc.)   |  **No (Rejected)**   | Tesla T4 lacks hardware FP8 tensor cores.                                                                         |
+| **Non-Causal Models**            | Any size                       | BERT, RoBERTa, CLIP, Whisper |  **No (Rejected)**   | vLLM `serve` is designed for causal autoregressive text and multimodal generative generation.                     |
 
 ---
 
@@ -109,19 +109,19 @@ HF_TOKEN = None
 
 ### Parameter Explanations
 
-| Parameter                | Default            | Description & Behavior                                                                                    |
-| :----------------------- | :----------------- | :-------------------------------------------------------------------------------------------------------- |
-| `MODEL_ID`               | _Required_         | Hugging Face repository ID (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct`, `zai-org/GLM-OCR`, `meta-llama/Llama-3.1-8B-Instruct`). |
-| `SERVED_MODEL_NAME`      | Sanitized basename | OpenAI API model alias registered in vLLM. Must be a single, clean alias string.                          |
-| `TENSOR_PARALLEL_SIZE`   | `2`                | Number of GPUs to shard model weights across. Dual T4 requires `2` for models >= 7B.                      |
+| Parameter                | Default            | Description & Behavior                                                                                                                       |
+| :----------------------- | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODEL_ID`               | _Required_         | Hugging Face repository ID (e.g., `Qwen/Qwen2.5-Coder-7B-Instruct`, `zai-org/GLM-OCR`, `meta-llama/Llama-3.1-8B-Instruct`).                  |
+| `SERVED_MODEL_NAME`      | Sanitized basename | OpenAI API model alias registered in vLLM. Must be a single, clean alias string.                                                             |
+| `TENSOR_PARALLEL_SIZE`   | `2`                | Number of GPUs to shard model weights across. Dual T4 requires `2` for models >= 7B.                                                         |
 | `MAX_MODEL_LEN`          | `4096`             | Context length limit. If the model config defines a smaller context, preflight caps to the native length. Minimum 512 for multimodal models. |
-| `MAX_NUM_SEQS`           | `4`                | Maximum concurrent request sequences handled by vLLM. Preserves VRAM headroom.                            |
-| `GPU_MEMORY_UTILIZATION` | `0.85`             | Fraction of GPU memory allocated to vLLM (weights + KV cache). Reserves ~15% for CUDA runtime.            |
-| `DTYPE`                  | `None`             | Precision override. Preflight enforces `float16` for Tesla T4.                                            |
-| `QUANTIZATION`           | `None`             | Quantization override (`awq`, `gptq`). If `None`, preflight auto-detects from model `config.json`.        |
-| `TRUST_REMOTE_CODE`      | `None`             | Automatically set to `True` for causal and multimodal LMs requiring custom modeling code.                 |
-| `EXTRA_VLLM_ARGS`        | `None`             | Additional CLI flags passed directly to `vllm serve` (e.g. `--limit-mm-per-prompt image=1`).              |
-| `HF_TOKEN`               | `None`             | Access token for gated or private Hugging Face repositories. Masked in all logs.                          |
+| `MAX_NUM_SEQS`           | `4`                | Maximum concurrent request sequences handled by vLLM. Preserves VRAM headroom.                                                               |
+| `GPU_MEMORY_UTILIZATION` | `0.85`             | Fraction of GPU memory allocated to vLLM (weights + KV cache). Reserves ~15% for CUDA runtime.                                               |
+| `DTYPE`                  | `None`             | Precision override. Preflight enforces `float16` for Tesla T4.                                                                               |
+| `QUANTIZATION`           | `None`             | Quantization override (`awq`, `gptq`). If `None`, preflight auto-detects from model `config.json`.                                           |
+| `TRUST_REMOTE_CODE`      | `None`             | Automatically set to `True` for causal and multimodal LMs requiring custom modeling code.                                                    |
+| `EXTRA_VLLM_ARGS`        | `None`             | Additional CLI flags passed directly to `vllm serve` (e.g. `--limit-mm-per-prompt image=1`).                                                 |
+| `HF_TOKEN`               | `None`             | Access token for gated or private Hugging Face repositories. Masked in all logs.                                                             |
 
 ---
 

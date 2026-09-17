@@ -11,14 +11,14 @@ Two deployment workflows are supported:
 
 ## Script Index
 
-| Script               | Purpose                                                                                         | Key Subcommands                                                              |
-| :------------------- | :---------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------- |
-| **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.        | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop` |
+| Script               | Purpose                                                                                         | Key Subcommands                                                                     |
+| :------------------- | :---------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.        | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`        |
 | **`preflight.py`**   | Hugging Face Hub inspector and hardware compatibility validator (standard library Python 3.8+). | `--model-id`, `--json`, `--tensor-parallel-size`, `--hf-token`, `--extra-vllm-args` |
-| **`test_image.py`**  | Pure standard library PNG generator and base64 data URI encoder for multimodal OCR smoke tests. | `[text]` (prints `data:image/png;base64,...`)                                |
-| **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                            | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`              |
-| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.  | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                        |
-| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.        | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                    |
+| **`test_image.py`**  | Pure standard library PNG generator and base64 data URI encoder for multimodal OCR smoke tests. | `[text]` (prints `data:image/png;base64,...`)                                       |
+| **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                            | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`                     |
+| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.  | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                               |
+| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.        | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                           |
 
 ---
 
