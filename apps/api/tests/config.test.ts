@@ -111,6 +111,53 @@ describe('Configuration & Security Hardening', () => {
     });
   });
 
+  describe('Generic vLLM Configuration (VLLM_BASE_URL)', () => {
+    it('parses generic VLLM_BASE_URL and VLLM_MODEL into vllm backend', () => {
+      const config = loadConfig({
+        LOG_LEVEL: 'silent',
+        VLLM_BASE_URL: 'https://vllm.example.com/v1',
+        VLLM_MODEL: 'gpt2',
+        VLLM_API_KEY: 'test-key',
+      });
+
+      expect(config.env.VLLM_BASE_URL).toBe('https://vllm.example.com/v1');
+      expect(config.env.VLLM_MODEL).toBe('gpt2');
+      const vllmBackend = config.openAiCompatibleBackends.find((b) => b.id === 'vllm');
+      expect(vllmBackend).toBeDefined();
+      expect(vllmBackend?.name).toBe('vLLM');
+      expect(vllmBackend?.baseUrl).toBe('https://vllm.example.com/v1');
+      expect(vllmBackend?.apiKey).toBe('test-key');
+      expect(vllmBackend?.models).toEqual(['gpt2']);
+    });
+
+    it('parses multiple models from VLLM_MODELS', () => {
+      const config = loadConfig({
+        LOG_LEVEL: 'silent',
+        VLLM_BASE_URL: 'https://vllm.example.com/v1',
+        VLLM_MODELS: 'gpt2, qwen2.5-coder-7b, glm-ocr',
+      });
+
+      const vllmBackend = config.openAiCompatibleBackends.find((b) => b.id === 'vllm');
+      expect(vllmBackend?.models).toEqual(['gpt2', 'qwen2.5-coder-7b', 'glm-ocr']);
+    });
+
+    it('rejects collision when ADDITIONAL_PROVIDERS uses id vllm', () => {
+      expect(() =>
+        loadConfig({
+          LOG_LEVEL: 'silent',
+          VLLM_BASE_URL: 'https://vllm.example.com/v1',
+          ADDITIONAL_PROVIDERS: JSON.stringify([
+            {
+              id: 'vllm',
+              baseUrl: 'https://other-vllm.example.com/v1',
+              models: ['model-x'],
+            },
+          ]),
+        }),
+      ).toThrow(/Duplicate provider id "vllm"/);
+    });
+  });
+
   describe('CORS_ORIGINS Configuration', () => {
     it('restricts CORS origin when CORS_ORIGINS is configured', async () => {
       const config = loadConfig({

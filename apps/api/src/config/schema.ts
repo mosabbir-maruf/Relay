@@ -141,7 +141,13 @@ export const EnvironmentSchema = z.object({
   ),
   OPENAI_COMPATIBLE_MODELS: optionalTrimmedString,
 
-  // Qwen (vLLM OpenAI-Compatible) Configuration
+  // Generic vLLM (OpenAI-Compatible) Configuration
+  VLLM_BASE_URL: optionalHttpUrlString,
+  VLLM_API_KEY: optionalTrimmedString,
+  VLLM_MODEL: optionalTrimmedString,
+  VLLM_MODELS: optionalTrimmedString,
+
+  // Legacy Qwen (vLLM OpenAI-Compatible) Configuration (backward compatibility)
   QWEN_BASE_URL: optionalHttpUrlString,
   QWEN_API_KEY: optionalTrimmedString,
   QWEN_MODEL: optionalTrimmedString,
@@ -273,6 +279,41 @@ export function loadConfig(
     openAiCompatibleBackends.push(backend);
   }
 
+  if (env.VLLM_BASE_URL) {
+    const rawModels: string[] = [];
+    if (env.VLLM_MODEL) {
+      rawModels.push(env.VLLM_MODEL);
+    }
+    if (env.VLLM_MODELS) {
+      const split = env.VLLM_MODELS.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const m of split) {
+        if (!rawModels.includes(m)) {
+          rawModels.push(m);
+        }
+      }
+    }
+    const modelIds = rawModels.length > 0 ? rawModels : ['default'];
+
+    const backend: {
+      id: string;
+      name: string;
+      baseUrl: string;
+      apiKey?: string;
+      models: readonly string[];
+    } = {
+      id: 'vllm',
+      name: 'vLLM',
+      baseUrl: env.VLLM_BASE_URL,
+      models: modelIds,
+    };
+    if (env.VLLM_API_KEY) {
+      backend.apiKey = env.VLLM_API_KEY;
+    }
+    openAiCompatibleBackends.push(backend);
+  }
+
   if (env.QWEN_BASE_URL) {
     const rawModels: string[] = [];
     if (env.QWEN_MODEL) {
@@ -389,6 +430,7 @@ export function loadConfig(
 
     checkUrl(env.GEMINI_BASE_URL, 'GEMINI_BASE_URL');
     checkUrl(env.OPENAI_COMPATIBLE_BASE_URL, 'OPENAI_COMPATIBLE_BASE_URL');
+    checkUrl(env.VLLM_BASE_URL, 'VLLM_BASE_URL');
     checkUrl(env.QWEN_BASE_URL, 'QWEN_BASE_URL');
     for (const b of openAiCompatibleBackends) {
       checkUrl(b.baseUrl, `ADDITIONAL_PROVIDERS backend "${b.id}"`);

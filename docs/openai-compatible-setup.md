@@ -159,9 +159,28 @@ OPENAI_COMPATIBLE_MODELS=Qwen/Qwen2.5-Coder-7B-Instruct
 
 ---
 
-## 7. Dedicated Qwen Configuration
+## 7. Generic vLLM Configuration
 
-Relay provides dedicated configuration variables for Qwen backends, reusing the high-performance `OpenAICompatibleProvider` adapter under provider ID `qwen`:
+Relay provides model-agnostic configuration variables for any self-hosted model running on vLLM:
+
+```dotenv
+# Generic vLLM backend
+VLLM_BASE_URL=http://localhost:8000/v1
+VLLM_MODEL=gpt2
+# VLLM_API_KEY= (optional, leave unset if unauthenticated)
+```
+
+These same variables work unchanged for Qwen, GPT-2, GLM-OCR, Llama, or any other model served through vLLM. When configured:
+
+- `OpenAICompatibleProvider` is registered in `ProviderRegistry` with ID `vllm`.
+- The model specified in `VLLM_MODEL` is registered and exposed in `GET /v1/models` with `owned_by: "vllm"`.
+- Ingress requests for that model route automatically to `VLLM_BASE_URL` with full streaming, cancellation, and error normalization support.
+
+---
+
+## 8. Dedicated Qwen Configuration (Backward Compatibility)
+
+Relay also maintains dedicated configuration variables for legacy Qwen setups under provider ID `qwen`:
 
 ```dotenv
 # Qwen via vLLM
@@ -170,15 +189,9 @@ QWEN_MODEL=qwen3-coder-30b
 # QWEN_API_KEY= (optional, leave unset if unauthenticated)
 ```
 
-Any OpenAI-compatible backend can use the same provider abstraction, and Qwen through vLLM is a prime example. When configured:
-
-- `OpenAICompatibleProvider` is registered in `ProviderRegistry` with ID `qwen`.
-- The model `qwen3-coder-30b` is registered and exposed in `GET /v1/models` with `owned_by: "qwen"`.
-- Ingress requests for `model: "qwen3-coder-30b"` route automatically to `QWEN_BASE_URL` with full streaming, cancellation, and error normalization support.
-
 ---
 
-## 8. Dynamic Multi-Backend Configuration (`ADDITIONAL_PROVIDERS`)
+## 9. Dynamic Multi-Backend Configuration (`ADDITIONAL_PROVIDERS`)
 
 To add additional self-hosted or third-party OpenAI-compatible endpoints without changing code, define `ADDITIONAL_PROVIDERS` as a JSON array in `.env`:
 
@@ -190,7 +203,7 @@ Each configured backend is automatically instantiated via `OpenAICompatibleProvi
 
 ---
 
-## 9. Collision-Safe Routing & Model Resolution
+## 10. Collision-Safe Routing & Model Resolution
 
 Relay provides collision-safe routing:
 
@@ -201,7 +214,7 @@ Relay provides collision-safe routing:
 
 ---
 
-## 10. Production-Hardened Security & Reliability Features
+## 11. Production-Hardened Security & Reliability Features
 
 - **SSRF Prevention**: All provider base URLs are validated to strictly enforce `http:` or `https:` protocols.
 - **Request Body Limits**: Fastify ingress enforces a strict 10MB payload limit (`bodyLimit: 10485760`), returning HTTP 413 `payload_too_large` for oversized requests.

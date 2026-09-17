@@ -147,9 +147,9 @@ RELAY_API_KEY=
 # Google Gemini (Optional)
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# Qwen / Local vLLM Server (Optional)
-QWEN_BASE_URL=http://localhost:8000/v1
-QWEN_MODEL=qwen3-coder-30b
+# Generic vLLM Provider (Optional)
+VLLM_BASE_URL=http://localhost:8000/v1
+VLLM_MODEL=gpt2
 ```
 
 > [!TIP]
@@ -307,9 +307,12 @@ Configuration is validated at startup using Zod. The primary configuration optio
 | `GEMINI_API_KEY`                    | `string`  |                   _empty_                   | Google Gemini API key. Activates the Gemini provider when set.                    |
 | `GEMINI_BASE_URL`                   | `string`  | `https://generativelanguage.googleapis.com` | Gemini API root URL.                                                              |
 | `GEMINI_MODELS`                     | `string`  |           `gemini-2.5-flash,...`            | Comma-separated model IDs to register under Gemini.                               |
-| `QWEN_BASE_URL`                     | `string`  |                   _empty_                   | Endpoint URL for self-hosted Qwen vLLM backend (e.g. `http://localhost:8000/v1`). |
-| `QWEN_MODEL`                        | `string`  |              `qwen3-coder-30b`              | Model name exposed by the Qwen vLLM backend.                                      |
-| `QWEN_API_KEY`                      | `string`  |                   _empty_                   | Optional API key for the Qwen backend.                                            |
+| `VLLM_BASE_URL`                     | `string`  |                   _empty_                   | Endpoint URL for self-hosted vLLM backend (e.g. `http://localhost:8000/v1`).      |
+| `VLLM_MODEL`                        | `string`  |                   _empty_                   | Model name exposed by the generic vLLM backend (e.g. `gpt2`, `qwen2.5-coder-7b`). |
+| `VLLM_API_KEY`                      | `string`  |                   _empty_                   | Optional API key for the vLLM backend.                                            |
+| `QWEN_BASE_URL`                     | `string`  |                   _empty_                   | Legacy endpoint URL for self-hosted Qwen vLLM backend.                            |
+| `QWEN_MODEL`                        | `string`  |              `qwen3-coder-30b`              | Legacy model name exposed by the Qwen vLLM backend.                               |
+| `QWEN_API_KEY`                      | `string`  |                   _empty_                   | Optional API key for the legacy Qwen backend.                                     |
 | `OPENAI_COMPATIBLE_BASE_URL`        | `string`  |                   _empty_                   | Generic OpenAI-compatible endpoint URL (e.g. `http://localhost:11434/v1`).        |
 | `OPENAI_COMPATIBLE_MODELS`          | `string`  |                   _empty_                   | Comma-separated list of models available on the generic backend.                  |
 | `ADDITIONAL_PROVIDERS`              | `string`  |                   _empty_                   | JSON array of extra OpenAI-compatible backends.                                   |

@@ -213,17 +213,30 @@ Models such as `meta-llama/Meta-Llama-3-8B-Instruct` require accepting a license
 
 ## Connecting to Relay
 
-At the end of the notebook execution, the script prints a ready-to-copy Relay configuration snippet using the multi-provider `ADDITIONAL_PROVIDERS` JSON schema.
+At the end of the notebook execution, Step 15 prints ready-to-copy Relay configuration snippets.
 
-Add this snippet to your local Relay `.env` file:
+### Option 1: Generic vLLM Environment Variables (Recommended)
+
+Add these variables to your local Relay `.env` file:
+
+```dotenv
+VLLM_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1
+VLLM_MODEL=gpt2
+```
+
+These same fields work unchanged for Qwen, GPT-2, GLM-OCR, Llama, or any other model served through vLLM.
+
+### Option 2: Multi-Provider Configuration (`ADDITIONAL_PROVIDERS`)
+
+To configure multiple concurrent backends, define `ADDITIONAL_PROVIDERS` as a JSON array:
 
 ```dotenv
 ADDITIONAL_PROVIDERS='[
   {
-    "id": "kaggle-qwen2.5-coder-7b",
-    "name": "Kaggle vLLM (Qwen/Qwen2.5-Coder-7B-Instruct)",
+    "id": "kaggle-gpt2",
+    "name": "Kaggle vLLM (openai-community/gpt2)",
     "baseUrl": "https://<tunnel-subdomain>.trycloudflare.com/v1",
-    "models": ["qwen2.5-coder-7b"]
+    "models": ["gpt2"]
   }
 ]'
 ```

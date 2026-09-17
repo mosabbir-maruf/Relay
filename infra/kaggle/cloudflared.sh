@@ -140,9 +140,12 @@ start_tunnel() {
       model_alias=$(python3 -c "import sys, os; sys.path.insert(0, '${SCRIPT_DIR}'); import preflight; print(preflight.sanitize_served_name('${MODEL_ID}'))" 2>/dev/null || true)
     fi
 
+    echo "VLLM_BASE_URL=${tunnel_url}/v1"
     if [ -n "${model_alias}" ]; then
+      echo "VLLM_MODEL=${model_alias}"
       echo "MODEL=${model_alias}"
     elif [ -n "${QWEN_MODEL:-}" ]; then
+      echo "VLLM_MODEL=${QWEN_MODEL}"
       echo "QWEN_BASE_URL=${tunnel_url}/v1"
       echo "QWEN_MODEL=${QWEN_MODEL}"
     fi
