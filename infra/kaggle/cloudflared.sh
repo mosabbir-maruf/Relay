@@ -14,10 +14,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK_DIR:-/kaggle/working}"
 BIN_PATH="${WORK_DIR}/cloudflared"
 LOG_FILE="${WORK_DIR}/cloudflared.log"
 PID_FILE="${WORK_DIR}/cloudflared.pid"
+URL_FILE="${WORK_DIR}/public_tunnel_url.txt"
 LOCAL_TARGET="${LOCAL_TARGET:-http://127.0.0.1:8000}"
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
 
@@ -43,6 +45,15 @@ ensure_binary() {
 }
 
 extract_url() {
+  if [ -f "${URL_FILE}" ]; then
+    local cached_url
+    cached_url=$(cat "${URL_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "${cached_url}" =~ ^https://[a-zA-Z0-9-]+\.trycloudflare\.com ]]; then
+      echo "${cached_url}"
+      return 0
+    fi
+  fi
+
   if [ ! -f "${LOG_FILE}" ]; then
     echo "ERROR: Log file ${LOG_FILE} does not exist." >&2
     return 1
@@ -51,6 +62,7 @@ extract_url() {
   local url
   url=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "${LOG_FILE}" | tail -n 1 || true)
   if [ -n "${url}" ]; then
+    echo "${url}" > "${URL_FILE}" 2>/dev/null || true
     echo "${url}"
     return 0
   else
@@ -67,13 +79,22 @@ start_tunnel() {
     existing_pid=$(cat "${PID_FILE}" 2>/dev/null || true)
     if [ -n "${existing_pid}" ] && kill -0 "${existing_pid}" 2>/dev/null; then
       echo "cloudflared is already running (PID ${existing_pid})."
-      echo "Current Public URL: $(extract_url || echo 'checking...')"
+      local cur_url
+      cur_url=$(extract_url 2>/dev/null || true)
+      if [ -n "${cur_url}" ]; then
+        echo "Current Public URL: ${cur_url}"
+        echo "PUBLIC_URL=${cur_url}"
+        echo "BASE_URL=${cur_url}/v1"
+        echo "PUBLIC_TUNNEL_URL=${cur_url}"
+      else
+        echo "Current Public URL: checking..."
+      fi
       return 0
     fi
   fi
 
   echo "Starting Cloudflare Quick Tunnel pointing to ${LOCAL_TARGET}..."
-  rm -f "${LOG_FILE}" "${PID_FILE}"
+  rm -f "${LOG_FILE}" "${PID_FILE}" "${URL_FILE}"
 
   nohup "${BIN_PATH}" tunnel --url "${LOCAL_TARGET}" --logfile "${LOG_FILE}" >/dev/null 2>&1 &
   local pid=$!
@@ -93,6 +114,7 @@ start_tunnel() {
   done
 
   if [ -n "${tunnel_url}" ]; then
+    echo "${tunnel_url}" > "${URL_FILE}" 2>/dev/null || true
     echo -e "\n========================================================"
     echo "SUCCESS: Cloudflare Quick Tunnel is LIVE!"
     echo "Public URL: ${tunnel_url}"
@@ -100,6 +122,7 @@ start_tunnel() {
     echo "========================================================"
     echo "PUBLIC_URL=${tunnel_url}"
     echo "BASE_URL=${tunnel_url}/v1"
+    echo "PUBLIC_TUNNEL_URL=${tunnel_url}"
     local model_alias="${SERVED_MODEL_NAME:-}"
     if [ -z "${model_alias}" ] && [ -f "${WORK_DIR}/served_model_name.txt" ]; then
       model_alias=$(cat "${WORK_DIR}/served_model_name.txt" 2>/dev/null || true)
@@ -159,9 +182,10 @@ stop_tunnel() {
     else
       echo "cloudflared (PID ${pid}) was not running."
     fi
-    rm -f "${PID_FILE}"
+    rm -f "${PID_FILE}" "${URL_FILE}"
   else
     echo "No PID file found at ${PID_FILE}."
+    rm -f "${URL_FILE}"
   fi
 }
 

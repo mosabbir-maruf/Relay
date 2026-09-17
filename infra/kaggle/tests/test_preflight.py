@@ -1096,6 +1096,178 @@ for a in data.get('command_args', []):
         self.assertTrue(any(c.get("type") == "image_url" for c in contents))
         self.assertTrue(any(c.get("type") == "text" for c in contents))
 
+    # --- Cloudflare Tunnel URL Propagation & Verification Tests ---
+
+    def test_validate_tunnel_url(self):
+        """Tests validate_tunnel_url under valid, invalid, and edge-case URLs."""
+        # Valid URLs
+        valid, msg = preflight.validate_tunnel_url("https://stephanie-nerve-faces-alarm.trycloudflare.com")
+        self.assertTrue(valid, msg)
+        self.assertEqual(msg, "")
+
+        valid, msg = preflight.validate_tunnel_url("https://subdomain.example.com/v1")
+        self.assertTrue(valid, msg)
+
+        # Invalid: Empty or None
+        valid, msg = preflight.validate_tunnel_url(None)
+        self.assertFalse(valid)
+        self.assertIn("empty", msg.lower())
+
+        valid, msg = preflight.validate_tunnel_url("")
+        self.assertFalse(valid)
+
+        # Invalid: Insecure HTTP scheme
+        valid, msg = preflight.validate_tunnel_url("http://stephanie-nerve-faces-alarm.trycloudflare.com")
+        self.assertFalse(valid)
+        self.assertIn("https", msg.lower())
+
+        # Invalid: Missing hostname
+        valid, msg = preflight.validate_tunnel_url("https://")
+        self.assertFalse(valid)
+        self.assertIn("hostname", msg.lower())
+
+        # Invalid: Single-label hostname without domain dot
+        valid, msg = preflight.validate_tunnel_url("https://myhostname")
+        self.assertFalse(valid)
+        self.assertIn("dot", msg.lower())
+
+        # Invalid: Localhost / 127.0.0.1 / null
+        valid, msg = preflight.validate_tunnel_url("https://localhost")
+        self.assertFalse(valid)
+        valid, msg = preflight.validate_tunnel_url("https://null")
+        self.assertFalse(valid)
+
+    def test_extract_tunnel_url_from_shell_output(self):
+        """Tests authoritative extraction of tunnel URL from diverse shell output formats."""
+        # Case 1: Standard cloudflared.sh start banner with PUBLIC_URL & BASE_URL
+        shell_banner = """
+========================================================
+SUCCESS: Cloudflare Quick Tunnel is LIVE!
+Public URL: https://stephanie-nerve-faces-alarm.trycloudflare.com
+Base URL:   https://stephanie-nerve-faces-alarm.trycloudflare.com/v1
+========================================================
+PUBLIC_URL=https://stephanie-nerve-faces-alarm.trycloudflare.com
+BASE_URL=https://stephanie-nerve-faces-alarm.trycloudflare.com/v1
+PUBLIC_TUNNEL_URL=https://stephanie-nerve-faces-alarm.trycloudflare.com
+MODEL=gpt2
+"""
+        extracted = preflight.extract_tunnel_url(output_or_text=shell_banner)
+        self.assertEqual(extracted, "https://stephanie-nerve-faces-alarm.trycloudflare.com")
+
+        # Case 2: Output with quotes or whitespace
+        output_quotes = "PUBLIC_URL='https://quoted-tunnel-123.trycloudflare.com'\n"
+        self.assertEqual(
+            preflight.extract_tunnel_url(output_or_text=output_quotes),
+            "https://quoted-tunnel-123.trycloudflare.com",
+        )
+
+        # Case 3: Raw daemon log text
+        raw_log = "2026-09-17T17:15:30Z INF | https://logged-tunnel-456.trycloudflare.com |"
+        self.assertEqual(
+            preflight.extract_tunnel_url(output_or_text=raw_log),
+            "https://logged-tunnel-456.trycloudflare.com",
+        )
+
+    def test_extract_tunnel_url_file_persistence_and_stale_prevention(self):
+        """Tests reading from WORK_DIR/public_tunnel_url.txt and preventing stale URL reuse."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            url_file = os.path.join(tmpdir, "public_tunnel_url.txt")
+
+            # Initially empty -> returns None
+            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir))
+
+            # Write newly created tunnel URL
+            with open(url_file, "w", encoding="utf-8") as f:
+                f.write("https://fresh-tunnel-789.trycloudflare.com\n")
+
+            extracted = preflight.extract_tunnel_url(work_dir=tmpdir)
+            self.assertEqual(extracted, "https://fresh-tunnel-789.trycloudflare.com")
+
+            # Remove file (simulating stop_tunnel or start_tunnel cleanup)
+            os.remove(url_file)
+            self.assertIsNone(preflight.extract_tunnel_url(work_dir=tmpdir))
+
+    def test_resolve_canonical_tunnel_urls(self):
+        """Tests resolve_canonical_tunnel_urls producing canonical PUBLIC_TUNNEL_URL and derived BASE_URL."""
+        res = preflight.resolve_canonical_tunnel_urls("https://stephanie-nerve-faces-alarm.trycloudflare.com")
+        self.assertEqual(
+            res["public_tunnel_url"],
+            "https://stephanie-nerve-faces-alarm.trycloudflare.com",
+        )
+        self.assertEqual(
+            res["base_url"],
+            "https://stephanie-nerve-faces-alarm.trycloudflare.com/v1",
+        )
+
+        # Trailing slash handling
+        res_slash = preflight.resolve_canonical_tunnel_urls("https://stephanie-nerve-faces-alarm.trycloudflare.com/")
+        self.assertEqual(
+            res_slash["public_tunnel_url"],
+            "https://stephanie-nerve-faces-alarm.trycloudflare.com",
+        )
+        self.assertEqual(
+            res_slash["base_url"],
+            "https://stephanie-nerve-faces-alarm.trycloudflare.com/v1",
+        )
+
+        # Invalid URL raises ValueError
+        with self.assertRaises(ValueError):
+            preflight.resolve_canonical_tunnel_urls("not-a-valid-url")
+
+    @mock.patch("urllib.request.urlopen")
+    def test_verify_tunnel_readiness_guards_invalid_url_without_dns(self, mock_urlopen):
+        """Verifies verify_tunnel_readiness immediately aborts without network calls on invalid URL."""
+        # Empty
+        ready, msg, data = preflight.verify_tunnel_readiness("")
+        self.assertFalse(ready)
+        self.assertIn("Pre-validation failed", msg)
+        self.assertIsNone(data)
+        mock_urlopen.assert_not_called()
+
+        # None
+        ready, msg, data = preflight.verify_tunnel_readiness(None)
+        self.assertFalse(ready)
+        self.assertIn("Pre-validation failed", msg)
+        mock_urlopen.assert_not_called()
+
+        # Invalid scheme
+        ready, msg, data = preflight.verify_tunnel_readiness("http://insecure.trycloudflare.com")
+        self.assertFalse(ready)
+        self.assertIn("Pre-validation failed", msg)
+        mock_urlopen.assert_not_called()
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("urllib.request.urlopen")
+    def test_verify_tunnel_readiness_dns_retry_and_success(self, mock_urlopen, mock_sleep):
+        """Tests that transient DNS propagation delays (gaierror) are retried until HTTP 200 succeeds."""
+        import io
+        import socket
+
+        # First call: DNS resolution fails (gaierror)
+        # Second call: HTTP 200 response with model data
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"data": [{"id": "gpt2"}]}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        mock_urlopen.side_effect = [
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
+            mock_resp,
+        ]
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://stephanie-nerve-faces-alarm.trycloudflare.com",
+            timeout_secs=10,
+            poll_interval=0.1,
+        )
+
+        self.assertTrue(ready)
+        self.assertIn("HTTP 200", msg)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["data"][0]["id"], "gpt2")
+        self.assertEqual(mock_urlopen.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

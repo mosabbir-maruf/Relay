@@ -18,9 +18,12 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -479,6 +482,186 @@ def resolve_inference_test_plan(
             "temperature": 0.0,
         },
     }
+
+
+def validate_tunnel_url(url: Optional[str]) -> Tuple[bool, str]:
+    """
+    Validates that a tunnel URL is well-formed:
+    - Non-empty string
+    - Scheme is exactly 'https'
+    - Hostname is present, non-empty, and contains at least one dot
+    - No whitespace or invalid control characters
+    - Not localhost, null, or undefined
+    Returns (is_valid: bool, error_reason: str).
+    """
+    if not url or not isinstance(url, str):
+        return False, "URL is empty or not a string"
+
+    cleaned = url.strip().strip("'\"")
+    if not cleaned:
+        return False, "URL is empty after trimming"
+
+    try:
+        parsed = urllib.parse.urlparse(cleaned)
+    except Exception as e:
+        return False, f"Failed to parse URL: {e}"
+
+    if parsed.scheme.lower() != "https":
+        return False, f"Expected https scheme, got: {repr(parsed.scheme)}"
+
+    host = parsed.hostname
+    if not host or not host.strip():
+        return False, "Hostname is missing or empty"
+
+    host = host.strip()
+    if "." not in host:
+        return False, f"Hostname '{host}' must contain at least one domain separator dot"
+
+    if any(c in host for c in [" ", "\t", "\r", "\n"]):
+        return False, f"Hostname '{host}' contains illegal whitespace"
+
+    if host.lower() in {"none", "null", "undefined", "localhost", "127.0.0.1"}:
+        return False, f"Hostname '{host}' is not a valid public tunnel domain"
+
+    return True, ""
+
+
+def extract_tunnel_url(
+    output_or_text: Optional[str] = None,
+    work_dir: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Captures the public Cloudflare Quick Tunnel URL authoritatively.
+    Checks in order:
+    1. Shell output text (e.g. from cloudflared.sh start / url)
+    2. Persisted URL file WORK_DIR/public_tunnel_url.txt
+    3. Log file WORK_DIR/cloudflared.log (latest trycloudflare.com match)
+    4. Environment variable PUBLIC_TUNNEL_URL or PUBLIC_URL
+    Returns the validated, clean https://... URL string, or None.
+    """
+    candidates: List[str] = []
+
+    if output_or_text and isinstance(output_or_text, str):
+        # Match explicit key-values first
+        for pattern in [
+            r"(?:PUBLIC_TUNNEL_URL|PUBLIC_URL)\s*=\s*(https://[^\s\"']+)",
+            r"Public URL:\s*(https://[^\s\"']+)",
+            r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)",
+        ]:
+            matches = re.findall(pattern, output_or_text, flags=re.IGNORECASE)
+            for m in reversed(matches):
+                candidates.append(m.strip().rstrip("/"))
+
+    effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
+    url_file = os.path.join(effective_work_dir, "public_tunnel_url.txt")
+    if os.path.exists(url_file):
+        try:
+            with open(url_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                candidates.append(content.rstrip("/"))
+        except Exception:
+            pass
+
+    log_file = os.path.join(effective_work_dir, "cloudflared.log")
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                log_content = f.read()
+            matches = re.findall(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", log_content)
+            for m in reversed(matches):
+                candidates.append(m.strip().rstrip("/"))
+        except Exception:
+            pass
+
+    for env_var in ["PUBLIC_TUNNEL_URL", "PUBLIC_URL"]:
+        v = os.environ.get(env_var)
+        if v and str(v).strip():
+            candidates.append(str(v).strip().rstrip("/"))
+
+    # Check candidates in order and return first valid
+    for cand in candidates:
+        cand_clean = cand.strip().strip("'\"").rstrip("/")
+        is_valid, _ = validate_tunnel_url(cand_clean)
+        if is_valid:
+            return cand_clean
+
+    return None
+
+
+def resolve_canonical_tunnel_urls(tunnel_url: Optional[str]) -> Dict[str, str]:
+    """
+    Ensures canonical PUBLIC_TUNNEL_URL and derived BASE_URL:
+    BASE_URL is strictly derived from PUBLIC_TUNNEL_URL (f"{PUBLIC_TUNNEL_URL}/v1").
+    Raises ValueError if tunnel_url fails validation.
+    """
+    is_valid, err = validate_tunnel_url(tunnel_url)
+    if not is_valid:
+        raise ValueError(f"Invalid Cloudflare tunnel URL ({err}): {repr(tunnel_url)}")
+
+    clean_url = str(tunnel_url).strip().strip("'\"").rstrip("/")
+    return {
+        "public_tunnel_url": clean_url,
+        "base_url": f"{clean_url}/v1",
+    }
+
+
+def verify_tunnel_readiness(
+    tunnel_url: Optional[str],
+    timeout_secs: int = 45,
+    poll_interval: float = 2.0,
+    target_path: str = "/v1/models",
+) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """
+    Immediately verifies that:
+    1. URL is non-empty, scheme is https, hostname is present (via validate_tunnel_url).
+       If invalid, aborts IMMEDIATELY without attempting DNS resolution!
+    2. Repeatedly polls GET {tunnel_url}{target_path} until HTTP 200 is returned
+       or timeout expires (handling DNS propagation delays and 502 gateway warmups).
+    Returns (ready: bool, status_or_error_message: str, models_json: Optional[dict]).
+    """
+    is_valid, err = validate_tunnel_url(tunnel_url)
+    if not is_valid:
+        return False, f"Pre-validation failed: {err}", None
+
+    clean_url = str(tunnel_url).strip().strip("'\"").rstrip("/")
+    test_endpoint = f"{clean_url}{target_path}"
+    parsed = urllib.parse.urlparse(clean_url)
+    hostname = parsed.hostname or clean_url
+
+    start_time = time.time()
+    last_err: str = "no attempts made"
+
+    while time.time() - start_time < timeout_secs:
+        elapsed = int(time.time() - start_time)
+        try:
+            req = urllib.request.Request(
+                test_endpoint,
+                headers={"User-Agent": "Relay-Kaggle-Tunnel-Verifier/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    raw_body = resp.read().decode("utf-8")
+                    try:
+                        data = json.loads(raw_body)
+                    except Exception:
+                        data = {"raw": raw_body}
+                    return True, f"Tunnel is responsive and {target_path} returned HTTP 200 in {elapsed}s", data
+                else:
+                    last_err = f"Endpoint returned HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}: {e.reason}"
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, socket.gaierror) or "Name or service not known" in str(e.reason) or "nodename nor servname" in str(e.reason):
+                last_err = f"DNS lookup pending for {hostname} ({e.reason})"
+            else:
+                last_err = f"Connection error: {e.reason}"
+        except Exception as e:
+            last_err = f"Unexpected error: {e}"
+
+        time.sleep(poll_interval)
+
+    return False, f"Tunnel readiness check timed out after {timeout_secs}s for {test_endpoint}. Last diagnostic: {last_err}", None
 
 
 def detect_gpus() -> Dict[str, Any]:
