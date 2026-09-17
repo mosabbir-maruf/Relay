@@ -866,8 +866,7 @@ def recommend_configuration(
     cuda_per_gpu = mem_est["cuda_runtime"]["value"]
 
     # Stage 5: Utilization Calculation vs Deployment Policy Bounds
-    target_kv = max(kv_per_gpu, 1.0)
-    per_gpu_workload = round(w_per_gpu + v_per_gpu + cuda_per_gpu + target_kv, 2)
+    per_gpu_workload = round(w_per_gpu + v_per_gpu + cuda_per_gpu + kv_per_gpu, 2)
     raw_util = round(per_gpu_workload / eval_vram, 2)
     clamped_util = round(
         min(max(raw_util, POLICY_UTILIZATION_MIN), POLICY_UTILIZATION_MAX), 2
@@ -1391,7 +1390,7 @@ def print_diagnostic_report(
                 f"     Per-GPU Breakdown: {per_gpu.get('total', 0.0):.2f} GB/GPU under TP={resolved.get('tensor_parallel_size')}\n"
             )
             p(
-                f"                        (Weights: {per_gpu.get('weights', 0.0):.2f} GB, Visual: {per_gpu.get('visual', 0.0):.2f} GB [{per_gpu.get('visual_sharding')}], KV: {per_gpu.get('kv_cache', 0.0):.2f} GB [{per_gpu.get('kv_sharding')}])\n"
+                f"                        (Weights: {per_gpu.get('weights', 0.0):.2f} GB, Visual: {per_gpu.get('visual', 0.0):.2f} GB [{per_gpu.get('visual_sharding')}], KV: {per_gpu.get('kv_cache', 0.0):.2f} GB [{per_gpu.get('kv_sharding')}], CUDA: {per_gpu.get('cuda_runtime', 0.0):.2f} GB)\n"
             )
     p("\n")
 

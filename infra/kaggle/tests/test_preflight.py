@@ -94,6 +94,64 @@ class TestPreflight(unittest.TestCase):
             resolved["decisions"]["max_model_len"]["source"],
             "bounded_native_context",
         )
+        # Verify memory breakdown reconciliation
+        per_gpu = resolved["memory_breakdown"]["per_gpu_workload_gb"]
+        self.assertEqual(
+            per_gpu["total"],
+            round(
+                per_gpu["weights"]
+                + per_gpu["visual"]
+                + per_gpu["kv_cache"]
+                + per_gpu["cuda_runtime"],
+                2,
+            ),
+        )
+
+    # Regression Test: GPT-2 TP=1 Memory Reconciliation
+    def test_gpt2_memory_breakdown_reconciliation_regression(self):
+        config = {
+            "architectures": ["GPT2LMHeadModel"],
+            "model_type": "gpt2",
+            "n_positions": 1024,
+            "n_ctx": 1024,
+            "n_embd": 768,
+            "n_head": 12,
+            "n_layer": 12,
+            "torch_dtype": "float32",
+        }
+        model_info = {"id": "openai-community/gpt2"}
+        attrs = preflight.inspect_model_attributes(model_info, config)
+        # Verify with exact 137M (0.14B) parameter count from live GPT-2 run
+        attrs["param_count"] = 137_022_720
+
+        resolved = preflight.resolve_configuration(
+            "openai-community/gpt2", attrs, {}, gpu_info=self.mock_t4_gpu
+        )
+        self.assertEqual(resolved["tensor_parallel_size"], 1)
+
+        mem = resolved["memory_breakdown"]
+        comps = mem["estimated_components"]
+        per_gpu = mem["per_gpu_workload_gb"]
+
+        weights_per_gpu = per_gpu["weights"]
+        visual_per_gpu = per_gpu["visual"]
+        kv_per_gpu = per_gpu["kv_cache"]
+        cuda_runtime = per_gpu["cuda_runtime"]
+        per_gpu_breakdown = per_gpu["total"]
+
+        # Exact regression requirement:
+        # per_gpu_breakdown == weights_per_gpu + visual_per_gpu + kv_per_gpu + cuda_runtime
+        self.assertEqual(
+            per_gpu_breakdown,
+            round(weights_per_gpu + visual_per_gpu + kv_per_gpu + cuda_runtime, 2),
+        )
+        # Values reconcile: 0.27 + 0.00 + 0.04 + 1.00 = 1.31 GB
+        self.assertEqual(weights_per_gpu, 0.27)
+        self.assertEqual(visual_per_gpu, 0.0)
+        self.assertEqual(kv_per_gpu, 0.04)
+        self.assertEqual(cuda_runtime, 1.0)
+        self.assertEqual(per_gpu_breakdown, 1.31)
+        self.assertEqual(comps["total_estimated_single_gpu_workload_gb"], 1.31)
 
     # 2. Qwen 7B FP16 Recommendations
     def test_qwen_7b_fp16_recommendations(self):
