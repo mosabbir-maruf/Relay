@@ -1237,9 +1237,12 @@ MODEL=gpt2
         self.assertIn("Pre-validation failed", msg)
         mock_urlopen.assert_not_called()
 
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["104.16.230.132"], "ok"))
     @mock.patch("time.sleep", return_value=None)
     @mock.patch("urllib.request.urlopen")
-    def test_verify_tunnel_readiness_dns_retry_and_success(self, mock_urlopen, mock_sleep):
+    def test_verify_tunnel_readiness_dns_retry_and_success(self, mock_urlopen, mock_sleep, mock_pub, mock_local, mock_tcp):
         """Tests that transient DNS propagation delays (gaierror) are retried until HTTP 200 succeeds."""
         import io
         import socket
@@ -1325,6 +1328,197 @@ MODEL=gpt2
             self.assertIn(socket.AF_INET, called_families)
         finally:
             socket.getaddrinfo = orig_getaddrinfo
+
+    @mock.patch("time.time", side_effect=[100.0, 100.1, 105.0, 105.0, 105.0])
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.query_local_dns")
+    @mock.patch("preflight.query_public_recursive_dns")
+    def test_readiness_hostname_not_yet_resolvable(self, mock_pub_dns, mock_local_dns, mock_sleep, mock_time):
+        """Tests that when hostname is not publicly visible, readiness times out and reports diagnostics."""
+        mock_pub_dns.return_value = (False, [], "Public recursive resolver (1.1.1.1) currently reports NXDOMAIN / no A record.")
+        mock_local_dns.return_value = (False, [], "Local system DNS resolution failed: socket.gaierror(-2, 'Name or service not known')")
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-pending-host.trycloudflare.com",
+            timeout_secs=2,
+            poll_interval=0.1,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(data)
+        self.assertIn("PUBLIC_DNS_UNAVAILABLE", msg)
+        self.assertIn("not yet publicly resolvable", msg)
+        self.assertIn("Local DNS result:", msg)
+        self.assertIn("Public recursive DNS result:", msg)
+        self.assertIn("cloudflared process:", msg)
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("urllib.request.urlopen")
+    @mock.patch("preflight.query_local_dns")
+    @mock.patch("preflight.query_public_recursive_dns")
+    def test_readiness_hostname_becomes_resolvable_after_polling(
+        self, mock_pub_dns, mock_local_dns, mock_urlopen, mock_tcp, mock_sleep
+    ):
+        """Tests that polling retries until hostname becomes publicly resolvable and endpoint responds."""
+        mock_pub_dns.side_effect = [
+            (False, [], "Public recursive resolver (1.1.1.1) currently reports NXDOMAIN / no A record."),
+            (True, ["104.16.230.132"], "Resolved via dig @1.1.1.1: ['104.16.230.132']"),
+        ]
+        mock_local_dns.side_effect = [
+            (False, [], "gaierror -2"),
+            (True, ["104.16.230.132"], "Resolved via local system DNS: ['104.16.230.132']"),
+        ]
+
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"data": [{"id": "gpt2"}]}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-delayed-host.trycloudflare.com",
+            timeout_secs=10,
+            poll_interval=0.1,
+            expected_model="gpt2",
+        )
+
+        self.assertTrue(ready)
+        self.assertIn("[READY]", msg)
+        self.assertIn("HTTP 200", msg)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["data"][0]["id"], "gpt2")
+
+    @mock.patch("time.time", side_effect=[100.0, 100.1, 105.0, 105.0, 105.0])
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.query_local_dns")
+    @mock.patch("preflight.query_public_recursive_dns")
+    def test_readiness_local_dns_failure_but_public_dns_success(self, mock_pub_dns, mock_local_dns, mock_sleep, mock_time):
+        """Tests distinction of local negative cache when public DNS already resolves the record."""
+        mock_pub_dns.return_value = (True, ["104.16.230.132"], "Resolved via dig @1.1.1.1: ['104.16.230.132']")
+        mock_local_dns.return_value = (False, [], "Local system DNS resolution failed: gaierror -2")
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-cache-mismatch.trycloudflare.com",
+            timeout_secs=2,
+            poll_interval=0.1,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(data)
+        self.assertIn("LOCAL_DNS_NEGATIVE_CACHE", msg)
+        self.assertIn("negative cache", msg.lower())
+        self.assertIn("Public recursive DNS result:", msg)
+        self.assertIn("Local DNS result:", msg)
+
+    @mock.patch("time.time", side_effect=[100.0, 100.1, 105.0, 105.0, 105.0])
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.query_local_dns")
+    @mock.patch("preflight.query_public_recursive_dns")
+    def test_readiness_both_local_and_public_dns_failure(self, mock_pub_dns, mock_local_dns, mock_sleep, mock_time):
+        """Tests that when both local and public DNS fail, hostname not publicly visible is reported."""
+        mock_pub_dns.return_value = (False, [], "Public recursive resolver (1.1.1.1) currently reports NXDOMAIN / no A record.")
+        mock_local_dns.return_value = (False, [], "Local system DNS resolution failed: gaierror -2")
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-both-fail.trycloudflare.com",
+            timeout_secs=2,
+            poll_interval=0.1,
+        )
+
+        self.assertFalse(ready)
+        self.assertIsNone(data)
+        self.assertIn("PUBLIC_DNS_UNAVAILABLE", msg)
+        self.assertIn("NXDOMAIN", msg)
+        self.assertIn("Local DNS result:", msg)
+        self.assertIn("Public recursive DNS result:", msg)
+
+    def test_readiness_malformed_url(self):
+        """Tests that malformed or empty URLs immediately fail pre-validation without polling."""
+        for bad_url in [
+            "",
+            None,
+            "http://insecure.trycloudflare.com",
+            "https://",
+            "https://invalid-single-label",
+            "https://localhost",
+        ]:
+            ready, msg, data = preflight.verify_tunnel_readiness(bad_url)
+            self.assertFalse(ready)
+            self.assertIn("MALFORMED_URL", msg)
+            self.assertIn("Pre-validation failed", msg)
+            self.assertIsNone(data)
+
+    @mock.patch("preflight.check_cloudflared_process_alive")
+    def test_readiness_dead_cloudflared_process(self, mock_proc_alive):
+        """Tests that when cloudflared PID is dead, polling aborts immediately without waiting."""
+        mock_proc_alive.return_value = (False, 8888, "cloudflared process PID 8888 does not exist")
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-dead-proc.trycloudflare.com",
+            timeout_secs=60,
+            pid=8888,
+        )
+
+        self.assertFalse(ready)
+        self.assertIn("PROCESS_DEAD", msg)
+        self.assertIn("PID 8888", msg)
+        self.assertIsNone(data)
+
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running"))
+    @mock.patch("urllib.request.urlopen")
+    def test_readiness_successful_dns_and_http(
+        self, mock_urlopen, mock_proc, mock_pub, mock_local, mock_tcp
+    ):
+        """Tests full success condition: live process + public DNS + local DNS + TCP/TLS + HTTP 200."""
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"data": [{"id": "gpt2"}]}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-success.trycloudflare.com",
+            expected_model="gpt2",
+            pid=1234,
+        )
+
+        self.assertTrue(ready)
+        self.assertIn("[READY]", msg)
+        self.assertIn("HTTP 200", msg)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["data"][0]["id"], "gpt2")
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("preflight.check_tcp_tls_connectivity", return_value=(True, "ok"))
+    @mock.patch("preflight.query_local_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.query_public_recursive_dns", return_value=(True, ["104.16.230.132"], "ok"))
+    @mock.patch("preflight.check_cloudflared_process_alive", return_value=(True, 1234, "running"))
+    @mock.patch("urllib.request.urlopen")
+    def test_readiness_expected_model_mismatch(
+        self, mock_urlopen, mock_proc, mock_pub, mock_local, mock_tcp, mock_sleep
+    ):
+        """Tests that when HTTP 200 is returned but expected model is not present, failure is reported."""
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"data": [{"id": "other-model"}]}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        ready, msg, data = preflight.verify_tunnel_readiness(
+            "https://test-mismatch.trycloudflare.com",
+            timeout_secs=2,
+            poll_interval=0.1,
+            expected_model="gpt2",
+            pid=1234,
+        )
+
+        self.assertFalse(ready)
+        self.assertIn("MODEL_NOT_FOUND", msg)
+        self.assertIn("expected model 'gpt2' not found", msg)
 
 
 if __name__ == "__main__":

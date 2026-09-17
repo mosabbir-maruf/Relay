@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -666,78 +667,381 @@ def resolve_canonical_tunnel_urls(tunnel_url: Optional[str]) -> Dict[str, str]:
     }
 
 
+def check_cloudflared_process_alive(
+    pid: Optional[int] = None,
+    work_dir: Optional[str] = None,
+) -> Tuple[bool, Optional[int], str]:
+    """
+    Verifies if the cloudflared daemon process is currently running.
+    Checks explicit pid or parses WORK_DIR/cloudflared.pid.
+    Returns (is_alive: bool, pid: Optional[int], status_message: str).
+    """
+    effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
+    target_pid = pid
+
+    if target_pid is None:
+        pid_file = os.path.join(effective_work_dir, "cloudflared.pid")
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content.isdigit():
+                    target_pid = int(content)
+            except Exception:
+                pass
+
+    if target_pid is None:
+        return False, None, "No cloudflared PID file found"
+
+    try:
+        os.kill(target_pid, 0)
+        return True, target_pid, f"cloudflared is running (PID {target_pid})"
+    except ProcessLookupError:
+        return False, target_pid, f"cloudflared process PID {target_pid} does not exist"
+    except PermissionError:
+        return True, target_pid, f"cloudflared process PID {target_pid} exists (permission denied to signal)"
+    except OSError as e:
+        return False, target_pid, f"cloudflared process PID {target_pid} check failed: {e}"
+
+
+def get_cloudflared_recent_logs(
+    work_dir: Optional[str] = None,
+    lines: int = 25,
+) -> str:
+    """
+    Reads the trailing lines from WORK_DIR/cloudflared.log.
+    """
+    effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
+    log_file = os.path.join(effective_work_dir, "cloudflared.log")
+    if not os.path.exists(log_file):
+        return "(cloudflared.log does not exist)"
+
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        return "".join(tail).strip() or "(cloudflared.log is empty)"
+    except Exception as e:
+        return f"(failed to read cloudflared.log: {e})"
+
+
+def query_public_recursive_dns(
+    hostname: str,
+    timeout: float = 3.0,
+) -> Tuple[bool, List[str], str]:
+    """
+    Queries public recursive DNS resolvers independently from the local OS resolver
+    to check public recursive DNS visibility.
+    Order of preference:
+    1. CLI dig @1.1.1.1 / @8.8.8.8 (if dig is available)
+    2. CLI nslookup against 1.1.1.1 / 8.8.8.8 (if nslookup is available)
+    3. Official DoH hostname endpoints (https://cloudflare-dns.com or https://dns.google)
+    Returns (is_visible: bool, ips: List[str], detail_message: str).
+    """
+    if not hostname or not isinstance(hostname, str):
+        return False, [], "Hostname is empty"
+
+    host = hostname.strip().lower()
+
+    # 1. Try dig @1.1.1.1 / @8.8.8.8
+    if shutil.which("dig"):
+        for dns_ip in ["1.1.1.1", "8.8.8.8"]:
+            try:
+                cmd = [
+                    "dig",
+                    f"@{dns_ip}",
+                    host,
+                    f"+time={max(1, int(timeout))}",
+                    "+tries=1",
+                ]
+                res = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout + 1,
+                )
+                out = res.stdout
+                if "status: NXDOMAIN" in out:
+                    return False, [], f"Public recursive resolver ({dns_ip}) currently reports NXDOMAIN / no A record."
+
+                ips = []
+                for line in out.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 5 and parts[3].upper() == "A":
+                        ip_cand = parts[4]
+                        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip_cand):
+                            ips.append(ip_cand)
+                if ips:
+                    return True, list(dict.fromkeys(ips)), f"Resolved via dig @{dns_ip}: {ips}"
+                if "status: NOERROR" in out and not ips:
+                    return False, [], f"Public recursive resolver ({dns_ip}) currently reports NOERROR but no A record."
+            except Exception:
+                pass
+
+    # 2. Try nslookup against 1.1.1.1 / 8.8.8.8
+    if shutil.which("nslookup"):
+        for dns_ip in ["1.1.1.1", "8.8.8.8"]:
+            try:
+                cmd = ["nslookup", host, dns_ip]
+                res = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout + 1,
+                )
+                combined = (res.stdout + "\n" + res.stderr).lower()
+                if "nxdomain" in combined or "can't find" in combined:
+                    return False, [], f"Public recursive resolver ({dns_ip}) currently reports NXDOMAIN / no A record."
+
+                ips = []
+                lines = res.stdout.splitlines()
+                in_answers = False
+                for line in lines:
+                    line_s = line.strip()
+                    if "answer:" in line_s.lower() or "name:" in line_s.lower():
+                        in_answers = True
+                    if in_answers and "address" in line_s.lower():
+                        match = re.search(r"address:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line_s, re.I)
+                        if match:
+                            ips.append(match.group(1))
+                if ips:
+                    return True, list(dict.fromkeys(ips)), f"Resolved via nslookup {dns_ip}: {ips}"
+            except Exception:
+                pass
+
+    # 3. Try official DoH hostname endpoints with TLS/SNI validation
+    doh_endpoints = [
+        ("https://cloudflare-dns.com/dns-query", {"Accept": "application/dns-json"}),
+        ("https://dns.google/resolve", {"Accept": "application/json"}),
+    ]
+    for base_url, headers in doh_endpoints:
+        try:
+            url = f"{base_url}?name={urllib.parse.quote(host)}&type=A"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Relay-Kaggle-DNS-Probe/1.0", **headers},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    status = data.get("Status")
+                    if status == 3:  # NXDOMAIN
+                        return False, [], f"Public recursive resolver ({base_url}) currently reports NXDOMAIN / no A record."
+                    if status == 0:  # NOERROR
+                        ips = [
+                            a["data"]
+                            for a in data.get("Answer", [])
+                            if a.get("type") == 1 and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", str(a.get("data", "")))
+                        ]
+                        if ips:
+                            return True, ips, f"Resolved via public DoH ({base_url}): {ips}"
+                        return False, [], f"Public recursive resolver ({base_url}) reports NOERROR but no A record."
+        except Exception:
+            pass
+
+    return False, [], "Public recursive DNS probe could not connect or timed out."
+
+
+def query_local_dns(
+    hostname: str,
+) -> Tuple[bool, List[str], str]:
+    """
+    Queries local system DNS via socket.getaddrinfo (with IPv4 fallback).
+    Returns (is_resolved: bool, ips: List[str], detail_message: str).
+    """
+    if not hostname or not isinstance(hostname, str):
+        return False, [], "Hostname is empty"
+
+    host = hostname.strip()
+    try:
+        addr_info = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        ips = list(dict.fromkeys([item[4][0] for item in addr_info]))
+        return True, ips, f"Resolved via local system DNS: {ips}"
+    except socket.gaierror as e:
+        # Retry with IPv4 only
+        try:
+            addr_info_v4 = socket.getaddrinfo(host, 443, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
+            ips = list(dict.fromkeys([item[4][0] for item in addr_info_v4]))
+            enable_ipv4_dns_fallback()
+            return True, ips, f"Resolved via local system DNS (IPv4 fallback): {ips}"
+        except Exception as v4_err:
+            return False, [], f"Local system DNS resolution failed: {e} (IPv4 fallback: {v4_err})"
+    except Exception as e:
+        return False, [], f"Local system DNS error: {e}"
+
+
+def check_tcp_tls_connectivity(
+    hostname: str,
+    port: int = 443,
+    timeout: float = 4.0,
+) -> Tuple[bool, str]:
+    """
+    Verifies TCP connectivity and TLS handshake to hostname:port.
+    Returns (is_connected: bool, detail_message: str).
+    """
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cipher = ssock.cipher()
+                cipher_name = cipher[0] if cipher else "established"
+                return True, f"TLS connection established with {hostname}:{port} (cipher: {cipher_name})"
+    except Exception as e:
+        return False, f"TCP/TLS handshake failed to {hostname}:{port}: {e}"
+
+
 def verify_tunnel_readiness(
     tunnel_url: Optional[str],
-    timeout_secs: int = 45,
+    timeout_secs: int = 90,
     poll_interval: float = 2.0,
     target_path: str = "/v1/models",
+    expected_model: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    pid: Optional[int] = None,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """
-    Immediately verifies that:
-    1. URL is non-empty, scheme is https, hostname is present (via validate_tunnel_url).
-       If invalid, aborts IMMEDIATELY without attempting DNS resolution!
-    2. Repeatedly polls GET {tunnel_url}{target_path} until HTTP 200 is returned
-       or timeout expires (handling DNS propagation delays and 502 gateway warmups).
+    Authoritative verification barrier for Cloudflare Quick Tunnels.
+    A newly created Quick Tunnel hostname may take some time before it becomes
+    publicly resolvable.
+
+    Success Condition:
+      Fresh URL captured
+      + cloudflared process alive
+      + public recursive DNS visibility
+      + local system DNS resolved
+      + TCP/TLS connected
+      + HTTP endpoint returns 200
+      + expected model confirmed (if specified).
+
+    Distinguishes failure stages:
+      - [MALFORMED_URL]
+      - [PROCESS_DEAD]
+      - [PUBLIC_DNS_UNAVAILABLE]
+      - [LOCAL_DNS_NEGATIVE_CACHE]
+      - [TCP_TLS_FAILURE]
+      - [HTTP_FAILURE] / [MODEL_NOT_FOUND]
+      - [TIMEOUT]
+
     Returns (ready: bool, status_or_error_message: str, models_json: Optional[dict]).
     """
     is_valid, err = validate_tunnel_url(tunnel_url)
     if not is_valid:
-        return False, f"Pre-validation failed: {err}", None
+        return False, f"[MALFORMED_URL] Pre-validation failed: {err}", None
 
     clean_url = clean_tunnel_url(tunnel_url)
     test_endpoint = f"{clean_url}{target_path}"
     parsed = urllib.parse.urlparse(clean_url)
     hostname = parsed.hostname or clean_url
-
-    # Check DNS resolution early with IPv4 fallback
-    try:
-        socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        try:
-            socket.getaddrinfo(hostname, 443, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
-            enable_ipv4_dns_fallback()
-        except Exception:
-            pass
+    effective_work_dir = work_dir or os.environ.get("WORK_DIR", "/kaggle/working")
 
     start_time = time.time()
-    last_err: str = "no attempts made"
+    last_stage: str = "INITIALIZING"
+    last_diag: str = "No probe attempts made yet"
+    pub_detail: str = "Not checked"
+    local_detail: str = "Not checked"
+    proc_msg: str = "Not checked"
 
     while time.time() - start_time < timeout_secs:
         elapsed = int(time.time() - start_time)
-        try:
-            req = urllib.request.Request(
-                test_endpoint,
-                headers={"User-Agent": "Relay-Kaggle-Tunnel-Verifier/1.0"},
+
+        # 1. Check cloudflared process liveness
+        alive, active_pid, proc_msg = check_cloudflared_process_alive(pid, effective_work_dir)
+        if (pid is not None) or os.path.exists(os.path.join(effective_work_dir, "cloudflared.pid")):
+            if not alive:
+                logs = get_cloudflared_recent_logs(effective_work_dir, lines=25)
+                err_msg = (
+                    f"[PROCESS_DEAD] cloudflared daemon is not running ({proc_msg}).\n"
+                    f"Hostname: {hostname}\n"
+                    f"Recent cloudflared logs:\n{logs}"
+                )
+                return False, err_msg, None
+
+        # 2. Check public recursive DNS visibility
+        pub_ok, pub_ips, pub_detail = query_public_recursive_dns(hostname, timeout=2.5)
+
+        # 3. Check local system DNS
+        local_ok, local_ips, local_detail = query_local_dns(hostname)
+
+        if not pub_ok and not local_ok:
+            last_stage = "PUBLIC_DNS_UNAVAILABLE"
+            last_diag = (
+                f"Hostname '{hostname}' is not yet publicly resolvable.\n"
+                f"- Public recursive DNS: {pub_detail}\n"
+                f"- Local system DNS: {local_detail}"
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status == 200:
-                    raw_body = resp.read().decode("utf-8")
-                    try:
-                        data = json.loads(raw_body)
-                    except Exception:
-                        data = {"raw": raw_body}
-                    return True, f"Tunnel is responsive and {target_path} returned HTTP 200 in {elapsed}s", data
-                else:
-                    last_err = f"Endpoint returned HTTP {resp.status}"
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}: {e.reason}"
-        except urllib.error.URLError as e:
-            if isinstance(e.reason, socket.gaierror) or "Name or service not known" in str(e.reason) or "nodename nor servname" in str(e.reason):
-                last_err = f"DNS lookup pending for {hostname} ({e.reason})"
-                # Try IPv4 fallback dynamically
-                try:
-                    socket.getaddrinfo(hostname, 443, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
-                    enable_ipv4_dns_fallback()
-                except Exception:
-                    pass
+        elif pub_ok and not local_ok:
+            last_stage = "LOCAL_DNS_NEGATIVE_CACHE"
+            last_diag = (
+                f"Public recursive DNS has visibility {pub_ips}, but local system resolver has negative cache or error: {local_detail}"
+            )
+        elif not pub_ok and local_ok:
+            last_stage = "PUBLIC_DNS_PENDING"
+            last_diag = f"Local DNS resolved {local_ips}, but public recursive resolver reports: {pub_detail}"
+        else:
+            # Both public and local DNS resolved!
+            # 4. Check TCP/TLS connectivity
+            tcp_ok, tcp_detail = check_tcp_tls_connectivity(hostname, 443, timeout=3.0)
+            if not tcp_ok:
+                last_stage = "TCP_TLS_FAILURE"
+                last_diag = tcp_detail
             else:
-                last_err = f"Connection error: {e.reason}"
-        except Exception as e:
-            last_err = f"Unexpected error: {e}"
+                # 5. Check HTTP probe
+                try:
+                    req = urllib.request.Request(
+                        test_endpoint,
+                        headers={"User-Agent": "Relay-Kaggle-Tunnel-Verifier/1.0"},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        if resp.status == 200:
+                            raw_body = resp.read().decode("utf-8")
+                            try:
+                                data = json.loads(raw_body)
+                            except Exception:
+                                data = {"raw": raw_body}
+                            models = [m.get("id") for m in data.get("data", [])] if isinstance(data, dict) else []
+                            if expected_model and expected_model not in models:
+                                last_stage = "MODEL_NOT_FOUND"
+                                last_diag = (
+                                    f"HTTP 200 returned, but expected model '{expected_model}' not found in {models}"
+                                )
+                            else:
+                                msg = (
+                                    f"[READY] Tunnel is fully verified and responsive in {elapsed}s (HTTP 200).\n"
+                                    f"Hostname: {hostname}\n"
+                                    f"Public Recursive DNS: {pub_ips}\n"
+                                    f"Local System DNS: {local_ips}\n"
+                                    f"Endpoint: {test_endpoint}\n"
+                                    f"Models: {models}"
+                                )
+                                return True, msg, data
+                        else:
+                            last_stage = "HTTP_UPSTREAM_WARMUP"
+                            last_diag = f"Endpoint returned HTTP {resp.status}"
+                except urllib.error.HTTPError as e:
+                    last_stage = "HTTP_ERROR"
+                    last_diag = f"HTTP {e.code}: {e.reason}"
+                except urllib.error.URLError as e:
+                    last_stage = "HTTP_CONNECTION_ERROR"
+                    last_diag = f"HTTP connection failed: {e.reason}"
+                except Exception as e:
+                    last_stage = "UNEXPECTED_ERROR"
+                    last_diag = f"Unexpected probe error: {e}"
 
         time.sleep(poll_interval)
 
-    return False, f"Tunnel readiness check timed out after {timeout_secs}s for {test_endpoint}. Last diagnostic: {last_err}", None
+    logs = get_cloudflared_recent_logs(effective_work_dir, lines=25)
+    err_msg = (
+        f"[{last_stage}] Tunnel readiness verification timed out after {timeout_secs}s for {test_endpoint}.\n"
+        f"Hostname '{hostname}' failed readiness verification.\n"
+        f"- Local DNS result: {local_detail}\n"
+        f"- Public recursive DNS result: {pub_detail}\n"
+        f"- cloudflared process: {proc_msg}\n"
+        f"- Last diagnostic: {last_diag}\n"
+        f"Recent cloudflared logs:\n{logs}"
+    )
+    return False, err_msg, None
 
 
 def detect_gpus() -> Dict[str, Any]:

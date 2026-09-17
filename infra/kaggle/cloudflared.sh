@@ -121,9 +121,10 @@ start_tunnel() {
   if [ -n "${tunnel_url}" ]; then
     echo "${tunnel_url}" > "${URL_FILE}" 2>/dev/null || true
     echo -e "\n========================================================"
-    echo "SUCCESS: Cloudflare Quick Tunnel is LIVE!"
+    echo "Cloudflare Quick Tunnel process launched and URL captured."
     echo "Public URL: ${tunnel_url}"
     echo "Base URL:   ${tunnel_url}/v1"
+    echo "NOTE: Public hostname propagation & endpoint readiness must be verified."
     echo "========================================================"
     echo "PUBLIC_URL=${tunnel_url}"
     echo "BASE_URL=${tunnel_url}/v1"
