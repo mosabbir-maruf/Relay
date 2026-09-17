@@ -156,4 +156,100 @@ describe('GET /v1/models', () => {
     const body = JSON.parse(response.body);
     expect(body.error.code).toBe('ambiguous_model');
   });
+
+  it('exposes max_model_len in GET /v1/models when advertised or configured', async () => {
+    const config = loadConfig({ LOG_LEVEL: 'silent' });
+    const registry = new ProviderRegistry();
+    const mockProvider = new TestMockProvider('vllm');
+    registry.registerProvider(mockProvider);
+
+    // Model with max_model_len extension
+    registry.registerModel({
+      id: 'gpt2',
+      name: 'GPT-2',
+      provider: 'vllm',
+      capabilities: mockProvider.getCapabilities('gpt2'),
+      max_model_len: 1024,
+    });
+
+    // Model without max_model_len
+    registry.registerModel({
+      id: 'standard-model',
+      name: 'Standard Model',
+      provider: 'vllm',
+      capabilities: mockProvider.getCapabilities('standard-model'),
+    });
+
+    const app = await createApp({
+      config,
+      registry,
+      serverOptions: { logger: false },
+    });
+
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models',
+    });
+
+    expect(listRes.statusCode).toBe(200);
+    const listBody = JSON.parse(listRes.body);
+    const gpt2 = listBody.data.find((m: any) => m.id === 'gpt2');
+    const standard = listBody.data.find((m: any) => m.id === 'standard-model');
+
+    expect(gpt2).toBeDefined();
+    expect(gpt2.max_model_len).toBe(1024);
+
+    expect(standard).toBeDefined();
+    expect(standard.max_model_len).toBeUndefined();
+
+    // Test GET /v1/models/:model
+    const singleRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models/gpt2',
+    });
+    expect(singleRes.statusCode).toBe(200);
+    const singleBody = JSON.parse(singleRes.body);
+    expect(singleBody.id).toBe('gpt2');
+    expect(singleBody.max_model_len).toBe(1024);
+  });
+
+  it('propagates upstream max_model_len discovered dynamically by provider', async () => {
+    const config = loadConfig({ LOG_LEVEL: 'silent' });
+    const registry = new ProviderRegistry();
+
+    class DynamicUpstreamProvider extends TestMockProvider {
+      getUpstreamModel(modelId: string) {
+        if (modelId === 'llama-3') {
+          return { id: 'llama-3', max_model_len: 8192 };
+        }
+        return undefined;
+      }
+    }
+
+    const provider = new DynamicUpstreamProvider('dynamic-provider');
+    registry.registerProvider(provider);
+
+    registry.registerModel({
+      id: 'llama-3',
+      name: 'Llama 3',
+      provider: 'dynamic-provider',
+      capabilities: provider.getCapabilities('llama-3'),
+    });
+
+    const app = await createApp({
+      config,
+      registry,
+      serverOptions: { logger: false },
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/models/llama-3',
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.id).toBe('llama-3');
+    expect(body.max_model_len).toBe(8192);
+  });
 });

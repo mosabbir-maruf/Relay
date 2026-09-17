@@ -271,4 +271,59 @@ describe('OpenAICompatibleProvider', () => {
       ),
     ).rejects.toThrow(RelayTimeoutError);
   });
+
+  it('captures upstream max_model_len from /models and safely synchronizes snapshot', async () => {
+    const provider = new OpenAICompatibleProvider({
+      id: 'vllm-provider',
+      baseUrl: 'http://localhost:8000/v1',
+    });
+
+    // 1. Initial healthCheck with gpt2 (max_model_len=1024)
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          object: 'list',
+          data: [
+            { id: 'gpt2', object: 'model', max_model_len: 1024 },
+            { id: 'old-model', object: 'model', max_model_len: 2048 },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const health = await provider.healthCheck();
+    expect(health.isHealthy).toBe(true);
+
+    // Verify gpt2 upstream metadata and capabilities
+    const gpt2Meta = provider.getUpstreamModel('gpt2');
+    expect(gpt2Meta).toBeDefined();
+    expect(gpt2Meta?.max_model_len).toBe(1024);
+
+    const gpt2Caps = provider.getCapabilities('gpt2');
+    expect(gpt2Caps.maxContextTokens).toBe(1024);
+    // Preserves default maxOutputTokens (4096) rather than treating max_model_len as output limit
+    expect(gpt2Caps.maxOutputTokens).toBe(4096);
+
+    // 2. Refresh /models with new snapshot: old-model is removed, llama-3 is added
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          object: 'list',
+          data: [
+            { id: 'gpt2', object: 'model', max_model_len: 1024 },
+            { id: 'llama-3', object: 'model', max_model_len: 8192 },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await provider.healthCheck();
+
+    // old-model was safely evicted (no permanently stale entries)
+    expect(provider.getUpstreamModel('old-model')).toBeUndefined();
+    expect(provider.getUpstreamModel('llama-3')?.max_model_len).toBe(8192);
+    expect(provider.getCapabilities('llama-3').maxContextTokens).toBe(8192);
+  });
 });

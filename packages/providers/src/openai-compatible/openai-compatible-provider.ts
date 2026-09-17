@@ -39,6 +39,11 @@ const DEFAULT_CAPABILITIES: ProviderCapabilities = {
   maxOutputTokens: 4096,
 };
 
+export interface UpstreamModelMetadata {
+  readonly id: string;
+  readonly max_model_len?: number;
+}
+
 /**
  * Generic provider adapter for any OpenAI-compatible inference server.
  * Supports OpenAI, vLLM, Ollama, Kaggle T4x2 remote GPU servers, and local endpoints.
@@ -50,6 +55,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
   private readonly apiKey?: string | undefined;
   private readonly customHeaders: Record<string, string>;
   private readonly capabilities: ProviderCapabilities;
+  private upstreamModels = new Map<string, UpstreamModelMetadata>();
 
   constructor(config: OpenAICompatibleConfig) {
     this.id = config.id ?? 'openai-compatible';
@@ -64,8 +70,27 @@ export class OpenAICompatibleProvider implements LLMProvider {
     };
   }
 
-  getCapabilities(_model: string): ProviderCapabilities {
+  getCapabilities(model: string): ProviderCapabilities {
+    const upstream = this.upstreamModels.get(model);
+    if (upstream?.max_model_len !== undefined && upstream.max_model_len > 0) {
+      return {
+        ...this.capabilities,
+        maxContextTokens: upstream.max_model_len,
+      };
+    }
     return this.capabilities;
+  }
+
+  getUpstreamModel(modelId: string): UpstreamModelMetadata | undefined {
+    return this.upstreamModels.get(modelId);
+  }
+
+  setUpstreamModels(models: Array<{ id: string; max_model_len?: number }>): void {
+    const nextSnapshot = new Map<string, UpstreamModelMetadata>();
+    for (const m of models) {
+      nextSnapshot.set(m.id, m);
+    }
+    this.upstreamModels = nextSnapshot;
   }
 
   async healthCheck(): Promise<ProviderHealth> {
@@ -83,6 +108,28 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
       const latencyMs = Date.now() - startTime;
       if (response.ok) {
+        try {
+          const body = (await response.json()) as { data?: Array<Record<string, unknown>> };
+          if (Array.isArray(body?.data)) {
+            const nextSnapshot = new Map<string, UpstreamModelMetadata>();
+            for (const item of body.data) {
+              if (item && typeof item['id'] === 'string') {
+                const maxModelLen =
+                  typeof item['max_model_len'] === 'number' && item['max_model_len'] > 0
+                    ? item['max_model_len']
+                    : undefined;
+                nextSnapshot.set(item['id'], {
+                  id: item['id'],
+                  ...(maxModelLen !== undefined ? { max_model_len: maxModelLen } : {}),
+                });
+              }
+            }
+            this.upstreamModels = nextSnapshot;
+          }
+        } catch {
+          // Preserve existing snapshot on non-JSON response
+        }
+
         return {
           isHealthy: true,
           latencyMs,

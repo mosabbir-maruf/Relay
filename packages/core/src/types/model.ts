@@ -14,4 +14,6 @@ export interface ModelInfo {
   readonly capabilities: ModelCapabilities;
   readonly created?: number;
   readonly ownedBy?: string;
+  /** Optional backend/vLLM metadata extension */
+  readonly max_model_len?: number;
 }

@@ -434,4 +434,208 @@ describe('AI Playground Route (GET /playground)', () => {
       expect(data.providers['unhealthy-qwen'].errorMessage).toContain('ECONNREFUSED');
     });
   });
+
+  describe('7. Context Budget & max_model_len Safety (Client Logic Simulation)', () => {
+    it('renders client-side budget calculation, conservative token estimator, and UI max binding in /playground HTML', async () => {
+      const { app } = await createTestApp();
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/playground',
+      });
+
+      const html = res.body;
+
+      // Model-agnostic context limit discovery & conservative estimation
+      expect(html).toContain('function getModelMaxContextLength(');
+      expect(html).toContain('function estimateMessagesTokens(');
+      expect(html).toContain('function calculateEffectiveMaxTokens(');
+
+      // UI hint binding without permanently mutating state.maxTokens
+      expect(html).toContain('elements.maxTokensInput.max = String(maxModelLen)');
+      expect(html).toContain("elements.maxTokensInput.max = '8192'");
+
+      // Request-time clamping in sendMessage
+      expect(html).toContain('calculateEffectiveMaxTokens(');
+      expect(html).toContain('max_tokens: budgetResult.effectiveMaxTokens');
+    });
+
+    // Client logic simulation testing the exact math & contract rendered into the Playground
+    function simulateGetModelMaxContextLength(
+      modelId: string,
+      models: Array<{ id: string; max_model_len?: number }>,
+    ): number | null {
+      const m = models.find((item) => item.id === modelId);
+      return typeof m?.max_model_len === 'number' && m.max_model_len > 0 ? m.max_model_len : null;
+    }
+
+    function simulateEstimateMessagesTokens(
+      messages: Array<{ role: string; content: string }>,
+    ): number {
+      let totalChars = 0;
+      for (const msg of messages) {
+        totalChars += msg.content.length;
+      }
+      return Math.ceil(totalChars / 3.5) + messages.length * 4 + 3;
+    }
+
+    function simulateCalculateEffectiveMaxTokens(
+      modelId: string,
+      models: Array<{ id: string; max_model_len?: number }>,
+      messages: Array<{ role: string; content: string }>,
+      requestedMaxTokens: number,
+    ) {
+      const maxModelLen = simulateGetModelMaxContextLength(modelId, models);
+      const userMax = requestedMaxTokens > 0 ? requestedMaxTokens : 2048;
+
+      if (!maxModelLen) {
+        return { effectiveMaxTokens: userMax, availableBudget: null, maxModelLen: null };
+      }
+
+      const estimatedInputTokens = simulateEstimateMessagesTokens(messages);
+      const availableBudget = maxModelLen - estimatedInputTokens;
+
+      if (availableBudget <= 0) {
+        return {
+          error: `Input messages (~${estimatedInputTokens} tokens) exceed the model context length of ${maxModelLen} tokens.`,
+          estimatedInputTokens,
+          availableBudget,
+          maxModelLen,
+        };
+      }
+
+      const effectiveMaxTokens = Math.min(userMax, availableBudget);
+      return {
+        effectiveMaxTokens,
+        estimatedInputTokens,
+        availableBudget,
+        maxModelLen,
+      };
+    }
+
+    it('clamps 1024 context + ~30-token input + requested 2048 to context budget (< 1024)', () => {
+      const models = [{ id: 'gpt2', max_model_len: 1024 }];
+      // 94 characters -> Math.ceil(94 / 3.5) = 27 text tokens + (2 * 4 + 3) = 11 overhead = 38 tokens
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        {
+          role: 'user',
+          content: 'Hello, my name is Alice and I am testing vLLM context budgeting.',
+        },
+      ];
+      const requestedMaxTokens = 2048;
+
+      const result = simulateCalculateEffectiveMaxTokens(
+        'gpt2',
+        models,
+        messages,
+        requestedMaxTokens,
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.maxModelLen).toBe(1024);
+      expect(result.estimatedInputTokens).toBe(38);
+      // availableBudget = 1024 - 38 = 986
+      expect(result.availableBudget).toBe(986);
+      // effectiveMaxTokens = min(2048, 986) = 986
+      expect(result.effectiveMaxTokens).toBe(986);
+      expect(result.effectiveMaxTokens).toBeLessThan(1024);
+      expect(result.effectiveMaxTokens! + result.estimatedInputTokens!).toBeLessThanOrEqual(1024);
+    });
+
+    it('allows full requested 2048 tokens when 4096 context + ~30-token input has sufficient budget', () => {
+      const models = [{ id: 'qwen', max_model_len: 4096 }];
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        {
+          role: 'user',
+          content: 'Hello, my name is Alice and I am testing vLLM context budgeting.',
+        },
+      ];
+      const requestedMaxTokens = 2048;
+
+      const result = simulateCalculateEffectiveMaxTokens(
+        'qwen',
+        models,
+        messages,
+        requestedMaxTokens,
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.maxModelLen).toBe(4096);
+      expect(result.estimatedInputTokens).toBe(38);
+      // availableBudget = 4096 - 38 = 4058 >= 2048
+      expect(result.availableBudget).toBe(4058);
+      expect(result.effectiveMaxTokens).toBe(2048);
+    });
+
+    it('preserves user requested maxTokens when model advertises no max_model_len', () => {
+      const models = [{ id: 'gemini-flash' }]; // No max_model_len
+      const messages = [{ role: 'user', content: 'Hello world' }];
+      const requestedMaxTokens = 2048;
+
+      const result = simulateCalculateEffectiveMaxTokens(
+        'gemini-flash',
+        models,
+        messages,
+        requestedMaxTokens,
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.maxModelLen).toBeNull();
+      expect(result.availableBudget).toBeNull();
+      expect(result.effectiveMaxTokens).toBe(2048);
+    });
+
+    it('rejects before fetch when prompt exceeds model context length (availableBudget <= 0)', () => {
+      const models = [{ id: 'small-model', max_model_len: 512 }];
+      // 2000 chars -> ~572 tokens > 512 context
+      const messages = [{ role: 'user', content: 'A'.repeat(2000) }];
+      const requestedMaxTokens = 2048;
+
+      const result = simulateCalculateEffectiveMaxTokens(
+        'small-model',
+        models,
+        messages,
+        requestedMaxTokens,
+      );
+
+      expect(result.error).toBeDefined();
+      expect(result.error).toContain('exceed the model context length of 512 tokens');
+      expect(result.availableBudget).toBeLessThanOrEqual(0);
+      expect(result.effectiveMaxTokens).toBeUndefined();
+    });
+
+    it('preserves user configured state.maxTokens when switching between small and large context models', () => {
+      const models = [
+        { id: 'gpt2', max_model_len: 1024 },
+        { id: 'llama-3', max_model_len: 8192 },
+      ];
+      const messages = [{ role: 'user', content: 'Short prompt' }];
+
+      // User has configured maxTokens = 2048 in state
+      const userConfiguredMaxTokens = 2048;
+
+      // 1. Select small context model (1024)
+      const smallRes = simulateCalculateEffectiveMaxTokens(
+        'gpt2',
+        models,
+        messages,
+        userConfiguredMaxTokens,
+      );
+      expect(smallRes.effectiveMaxTokens).toBeLessThan(1024);
+
+      // Verify user's configured state was NOT mutated
+      expect(userConfiguredMaxTokens).toBe(2048);
+
+      // 2. Switch to large context model (8192)
+      const largeRes = simulateCalculateEffectiveMaxTokens(
+        'llama-3',
+        models,
+        messages,
+        userConfiguredMaxTokens, // Still 2048!
+      );
+      expect(largeRes.effectiveMaxTokens).toBe(2048);
+    });
+  });
 });

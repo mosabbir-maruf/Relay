@@ -1341,12 +1341,112 @@ export function renderPlaygroundHtml(): string {
       }
     }
 
+    /**
+     * Reads the model's max_model_len backend/vLLM metadata extension from GET /v1/models if available.
+     * Model-agnostic: supports any OpenAI-compatible/vLLM model.
+     */
+    function getModelMaxContextLength(modelId) {
+      if (!modelId || !Array.isArray(state.models)) return null;
+      const m = state.models.find(item => {
+        if (!item || !item.id) return false;
+        if (item.id === modelId) return true;
+        if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
+        if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
+        return false;
+      });
+      if (!m) return null;
+      if (typeof m.max_model_len === 'number' && m.max_model_len > 0) {
+        return m.max_model_len;
+      }
+      return null;
+    }
+
+    /**
+     * Conservative client-side token count estimation across message history.
+     * Note: This is an intentionally conservative heuristic (~3.5 chars/token + formatting overhead),
+     * not an exact BPE/sentencepiece tokenizer.
+     */
+    function estimateMessagesTokens(messages) {
+      if (!Array.isArray(messages)) return 0;
+      let totalChars = 0;
+      for (const msg of messages) {
+        if (!msg) continue;
+        if (typeof msg.content === 'string') {
+          totalChars += msg.content.length;
+        } else if (Array.isArray(msg.content)) {
+          for (const part of msg.content) {
+            if (part && typeof part.text === 'string') totalChars += part.text.length;
+            else if (typeof part === 'string') totalChars += part;
+          }
+        } else if (msg.content) {
+          try {
+            totalChars += JSON.stringify(msg.content).length;
+          } catch {
+            // Ignore serialization errors
+          }
+        }
+      }
+      const textTokens = Math.ceil(totalChars / 3.5);
+      const framingOverhead = messages.length * 4 + 3;
+      return textTokens + framingOverhead;
+    }
+
+    /**
+     * Authoritative context budget calculation performed at request time.
+     * Guarantees requested max_tokens never exceeds the available context budget
+     * after accounting for input prompt/messages, while preserving the user's
+     * configured state.maxTokens across model switches.
+     */
+    function calculateEffectiveMaxTokens(modelId, messages, requestedMaxTokens) {
+      const maxModelLen = getModelMaxContextLength(modelId);
+      const userMax = typeof requestedMaxTokens === 'number' && requestedMaxTokens > 0
+        ? requestedMaxTokens
+        : 2048;
+
+      if (!maxModelLen) {
+        return { effectiveMaxTokens: userMax, availableBudget: null, maxModelLen: null };
+      }
+
+      const estimatedInputTokens = estimateMessagesTokens(messages);
+      const availableBudget = maxModelLen - estimatedInputTokens;
+
+      if (availableBudget <= 0) {
+        return {
+          error:
+            'Input messages (~' +
+            estimatedInputTokens +
+            ' tokens) exceed the model context length of ' +
+            maxModelLen +
+            ' tokens. Please shorten your prompt or clear conversation history.',
+          estimatedInputTokens,
+          availableBudget,
+          maxModelLen,
+        };
+      }
+
+      const effectiveMaxTokens = Math.min(userMax, availableBudget);
+      return {
+        effectiveMaxTokens,
+        estimatedInputTokens,
+        availableBudget,
+        maxModelLen,
+      };
+    }
+
     function updateActiveModelInfo() {
       const active = state.models.find(m => m.id === state.activeModel);
       if (active) {
         elements.modelOwnerTag.textContent = active.owned_by || 'provider';
       } else {
         elements.modelOwnerTag.textContent = '';
+      }
+
+      // UI hint: reflect model capacity in input max attribute if available
+      const maxModelLen = getModelMaxContextLength(state.activeModel);
+      if (maxModelLen && maxModelLen > 0) {
+        elements.maxTokensInput.max = String(maxModelLen);
+      } else {
+        elements.maxTokensInput.max = '8192';
       }
     }
 
@@ -1641,6 +1741,28 @@ export function renderPlaygroundHtml(): string {
         return;
       }
 
+      // Build candidate API messages to evaluate context budget
+      const candidateMessages = [];
+      if (state.systemPrompt) {
+        candidateMessages.push({ role: 'system', content: state.systemPrompt });
+      }
+      for (const m of state.messages) {
+        candidateMessages.push({ role: m.role, content: m.content });
+      }
+      candidateMessages.push({ role: 'user', content });
+
+      // Authoritative request-time context budget calculation
+      const budgetResult = calculateEffectiveMaxTokens(
+        state.activeModel,
+        candidateMessages,
+        state.maxTokens,
+      );
+
+      if (budgetResult.error) {
+        showError(budgetResult.error);
+        return;
+      }
+
       // Add user message
       state.messages.push({
         role: 'user',
@@ -1665,20 +1787,11 @@ export function renderPlaygroundHtml(): string {
       renderConversation();
       setGeneratingState(true);
 
-      // Build payload
-      const apiMessages = [];
-      if (state.systemPrompt) {
-        apiMessages.push({ role: 'system', content: state.systemPrompt });
-      }
-      for (const m of state.messages.slice(0, assistantIndex)) {
-        apiMessages.push({ role: m.role, content: m.content });
-      }
-
       const payload = {
         model: state.activeModel,
-        messages: apiMessages,
+        messages: candidateMessages,
         temperature: state.temperature,
-        max_tokens: state.maxTokens,
+        max_tokens: budgetResult.effectiveMaxTokens,
         stream: state.stream,
       };
 

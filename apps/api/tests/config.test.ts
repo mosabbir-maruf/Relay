@@ -156,6 +156,21 @@ describe('Configuration & Security Hardening', () => {
         }),
       ).toThrow(/Duplicate provider id "vllm"/);
     });
+
+    it('populates maxContextTokens and max_model_len on defaultModels when VLLM_MAX_MODEL_LEN is configured', () => {
+      const config = loadConfig({
+        LOG_LEVEL: 'silent',
+        VLLM_BASE_URL: 'https://vllm.example.com/v1',
+        VLLM_MODEL: 'gpt2',
+        VLLM_MAX_MODEL_LEN: '1024',
+      });
+
+      expect(config.env.VLLM_MAX_MODEL_LEN).toBe(1024);
+      const gpt2 = config.defaultModels.find((m) => m.id === 'gpt2');
+      expect(gpt2).toBeDefined();
+      expect(gpt2?.capabilities.maxContextTokens).toBe(1024);
+      expect(gpt2?.max_model_len).toBe(1024);
+    });
   });
 
   describe('CORS_ORIGINS Configuration', () => {

@@ -146,6 +146,7 @@ export const EnvironmentSchema = z.object({
   VLLM_API_KEY: optionalTrimmedString,
   VLLM_MODEL: optionalTrimmedString,
   VLLM_MODELS: optionalTrimmedString,
+  VLLM_MAX_MODEL_LEN: z.coerce.number().int().positive().optional(),
 
   // Legacy Qwen (vLLM OpenAI-Compatible) Configuration (backward compatibility)
   QWEN_BASE_URL: optionalHttpUrlString,
@@ -395,6 +396,8 @@ export function loadConfig(
 
   for (const backend of openAiCompatibleBackends) {
     for (const modelId of backend.models) {
+      const isVllm = backend.id === 'vllm';
+      const maxContextTokens = isVllm && env.VLLM_MAX_MODEL_LEN ? env.VLLM_MAX_MODEL_LEN : 32768;
       defaultModels.push({
         id: modelId,
         name: modelId,
@@ -404,9 +407,12 @@ export function loadConfig(
           supportsToolCalling: true,
           supportsVision: false,
           supportsStructuredOutput: true,
-          maxContextTokens: 32768,
+          maxContextTokens,
           maxOutputTokens: 4096,
         },
+        ...(isVllm && env.VLLM_MAX_MODEL_LEN !== undefined
+          ? { max_model_len: env.VLLM_MAX_MODEL_LEN }
+          : {}),
       });
     }
   }
