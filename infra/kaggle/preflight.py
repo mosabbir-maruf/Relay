@@ -1,504 +1,709 @@
 #!/usr/bin/env python3
-"""Self-service Hugging Face -> vLLM preflight for Kaggle dual NVIDIA T4.
-
-This module intentionally uses only Python's standard library. The Hugging Face
-Hub API is queried directly with urllib so the preflight step remains portable.
 """
+Relay Kaggle Infrastructure: Hugging Face & vLLM Preflight Validator
 
-from __future__ import annotations
+Inspects target Hugging Face models via the official Hub API, validates
+compatibility with the Kaggle dual NVIDIA Tesla T4 environment and vLLM,
+and resolves safe, deterministic execution parameters.
+
+Configuration Precedence:
+  User Overrides -> Model Metadata -> Hardware-Safe Defaults
+
+Compatible with Python 3.8+ (Zero third-party runtime dependencies).
+"""
 
 import argparse
 import json
 import os
-import shlex
+import re
+import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-VLLM_VERSION = os.environ.get("VLLM_VERSION", "0.29.0")
+# Safe hardware defaults for Kaggle dual NVIDIA Tesla T4
+DEFAULT_TENSOR_PARALLEL_SIZE = 2
 DEFAULT_MAX_MODEL_LEN = 4096
 DEFAULT_MAX_NUM_SEQS = 4
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
-DEFAULT_TP = 2
 DEFAULT_DTYPE = "float16"
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_ENFORCE_EAGER = True
 DEFAULT_PORT = 8000
-TOTAL_T4_VRAM_GB = 30.0
+DEFAULT_HOST = "0.0.0.0"
 
-SUPPORTED_CAUSAL_MARKERS = (
-    "ForCausalLM",
-    "CausalLM",
-    "ForConditionalGeneration",
-)
-UNSUPPORTED_ARCH_MARKERS = (
-    "Bert",
-    "Albert",
-    "Roberta",
-    "Deberta",
-    "Electra",
-    "DistilBert",
-    "XLMRoberta",
-    "CLIP",
-    "Whisper",
-    "Speech",
-    "Audio",
-    "AudioClassification",
-    "Wav2Vec",
-    "Diffusion",
-    "UNet",
-)
+# Dual Tesla T4 hardware parameters: 2x 16 GB (~15,109 MiB usable each) = ~30 GB total
+DUAL_T4_TOTAL_VRAM_GB = 29.5
+DUAL_T4_PER_GPU_VRAM_GB = 14.75
 
+# Unsupported non-causal LM architectures
+UNSUPPORTED_ARCH_PATTERNS = [
+    r"bert(model|for.*)?$",
+    r"roberta(model|for.*)?$",
+    r"deberta(model|for.*)?$",
+    r"albert(model|for.*)?$",
+    r"electra(model|for.*)?$",
+    r"clip(model|visionmodel|textmodel)?$",
+    r"whisper(forconditionalgeneration)?$",
+    r"stablediffusion.*",
+    r"diffusion.*",
+    r".*forsequenceclassification$",
+    r".*fortokenclassification$",
+    r".*forquestionanswering$",
+    r".*formaskedlm$",
+]
 
-class PreflightError(RuntimeError):
-    pass
-
-
-@dataclass
-class ModelMetadata:
-    model_id: str
-    model_type: Optional[str]
-    architectures: List[str]
-    parameter_count: Optional[int]
-    quantization: Optional[str]
-    quantization_bits: Optional[int]
-    torch_dtype: Optional[str]
-    context_length: Optional[int]
-    gated: bool
-    trust_remote_code: bool
-    pipeline_tag: Optional[str]
-
-
-@dataclass
-class Hardware:
-    gpu_count: int
-    gpu_names: List[str]
-    compute_capabilities: List[str]
-    total_vram_gb: float
+# Supported causal LM architecture patterns
+SUPPORTED_CAUSAL_PATTERNS = [
+    r".*forcausallm$",
+    r".*lmheadmodel$",
+    r".*forconditionalgeneration$",
+    r"llama.*",
+    r"qwen.*",
+    r"mistral.*",
+    r"mixtral.*",
+    r"gemma.*",
+    r"phi.*",
+    r"starcoder.*",
+    r"falcon.*",
+    r"internlm.*",
+    r"deepseek.*",
+    r"baichuan.*",
+    r"chatglm.*",
+    r"decilm.*",
+]
 
 
-def env_value(name: str) -> Optional[str]:
-    value = os.environ.get(name)
-    if value is None:
-        return None
-    value = value.strip()
-    return value if value else None
+def mask_token(token: Optional[str]) -> str:
+    """Masks authentication token for safe logging."""
+    if not token:
+        return "<none>"
+    clean = token.strip()
+    if len(clean) <= 8:
+        return "********"
+    return f"{clean[:4]}...{clean[-4:]}"
 
 
-def parse_int(value: Optional[str], name: str, minimum: int = 1) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise PreflightError(f"{name} must be an integer, got {value!r}.") from exc
-    if parsed < minimum:
-        raise PreflightError(f"{name} must be >= {minimum}, got {parsed}.")
-    return parsed
+def sanitize_served_name(model_id: str) -> str:
+    """Generates a clean OpenAI-compatible served model alias from HF model ID."""
+    name = model_id.split("/")[-1]
+    name = re.sub(r"[^a-zA-Z0-9._-]", "-", name).lower()
+    return name.strip("-")
 
 
-def parse_float(value: Optional[str], name: str, minimum: float, maximum: float) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise PreflightError(f"{name} must be numeric, got {value!r}.") from exc
-    if not minimum <= parsed <= maximum:
-        raise PreflightError(f"{name} must be between {minimum} and {maximum}, got {parsed}.")
-    return parsed
-
-
-def parse_bool(value: Optional[str], name: str) -> Optional[bool]:
-    if value is None:
-        return None
-    normalized = value.lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise PreflightError(f"{name} must be a boolean (true/false), got {value!r}.")
-
-
-def auth_token() -> Optional[str]:
-    return env_value("HF_TOKEN") or env_value("HUGGINGFACE_HUB_TOKEN")
-
-
-def http_json(url: str, token: Optional[str] = None) -> Dict[str, Any]:
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "relay-kaggle-vllm-preflight/1.0",
+def detect_gpus() -> Dict[str, Any]:
+    """Detects available NVIDIA GPUs via nvidia-smi."""
+    info: Dict[str, Any] = {
+        "available": False,
+        "count": 0,
+        "devices": [],
+        "total_vram_gb": 0.0,
+        "is_tesla_t4": False,
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise PreflightError(
-                "Hugging Face denied access to the model. The repository may be private or gated. "
-                "Grant access on Hugging Face and provide HF_TOKEN through a secure environment/Kaggle Secret."
-            ) from exc
-        if exc.code == 404:
-            raise PreflightError("Hugging Face model or config was not found (HTTP 404). Check MODEL_ID.") from exc
-        raise PreflightError(f"Hugging Face API request failed with HTTP {exc.code}.") from exc
-    except urllib.error.URLError as exc:
-        raise PreflightError(f"Unable to reach Hugging Face Hub: {exc.reason}") from exc
+
+    if not shutil.which("nvidia-smi"):
+        return info
 
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PreflightError(f"Hugging Face returned invalid JSON for {url}.") from exc
-    if not isinstance(value, dict):
-        raise PreflightError(f"Unexpected Hugging Face response shape for {url}.")
-    return value
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=index,name,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
+        lines = [line.strip() for line in res.strip().splitlines() if line.strip()]
+        info["available"] = len(lines) > 0
+        info["count"] = len(lines)
+
+        total_mb = 0.0
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            idx = int(parts[0]) if len(parts) > 0 else 0
+            name = parts[1] if len(parts) > 1 else "Unknown"
+            mem_mb = float(parts[2]) if len(parts) > 2 else 0.0
+            total_mb += mem_mb
+            info["devices"].append({"index": idx, "name": name, "memory_mb": mem_mb})
+            if "T4" in name.upper():
+                info["is_tesla_t4"] = True
+
+        info["total_vram_gb"] = round(total_mb / 1024.0, 2)
+    except Exception:
+        pass
+
+    return info
 
 
-def discover_model(model_id: str, token: Optional[str]) -> ModelMetadata:
-    encoded_id = "/".join(urllib.parse_quote(segment, safe="") for segment in model_id.split("/"))
-    api = http_json(f"https://huggingface.co/api/models/{encoded_id}", token)
+def fetch_hf_model_metadata(
+    model_id: str, hf_token: Optional[str] = None
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Fetches model metadata and config.json from the official Hugging Face Hub API.
+    Returns (model_info, config_dict).
+    """
+    headers = {"User-Agent": "Relay-Kaggle-Preflight/1.0"}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token.strip()}"
 
-    config: Dict[str, Any] = {}
+    # 1. Fetch Model Info
+    model_api_url = f"https://huggingface.co/api/models/{model_id}"
+    req = urllib.request.Request(model_api_url, headers=headers)
+
     try:
-        config = http_json(f"https://huggingface.co/{model_id}/resolve/main/config.json", token)
-    except PreflightError as exc:
-        # Some Hub responses omit config access even when model metadata is public.
-        # Keep discovery usable, but surface a warning through the diagnostic layer.
-        config = {"_config_error": str(exc)}
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            model_info = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            if hf_token:
+                raise PermissionError(
+                    f"Access denied for model '{model_id}' (HTTP {e.code}). "
+                    "Please verify your Hugging Face account has accepted the model's agreement/license."
+                ) from e
+            raise PermissionError(
+                f"Model '{model_id}' is gated or private (HTTP {e.code}). "
+                "A Hugging Face access token is required. Set HF_TOKEN in environment or Kaggle Secrets."
+            ) from e
+        if e.code == 404:
+            raise FileNotFoundError(
+                f"Model '{model_id}' was not found on Hugging Face Hub (HTTP 404). "
+                "Please verify the repository name."
+            ) from e
+        raise RuntimeError(
+            f"Failed to query Hugging Face API for '{model_id}': HTTP {e.code} {e.reason}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise ConnectionError(
+            f"Network connection to Hugging Face Hub failed: {e.reason}. "
+            "Ensure Internet is enabled in Kaggle notebook settings."
+        ) from e
 
-    architectures = [str(item) for item in config.get("architectures", []) if item]
-    parameter_count = None
-    safetensors = api.get("safetensors")
-    if isinstance(safetensors, dict):
-        value = safetensors.get("parameters")
-        if isinstance(value, int):
-            parameter_count = value
-    if parameter_count is None:
-        value = api.get("parameters")
-        if isinstance(value, int):
-            parameter_count = value
+    # 2. Fetch config.json if not present or incomplete in model_info
+    config = model_info.get("config")
+    if not isinstance(config, dict) or not config.get("architectures"):
+        config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
+        cfg_req = urllib.request.Request(config_url, headers=headers)
+        try:
+            with urllib.request.urlopen(cfg_req, timeout=12) as cfg_resp:
+                config = json.loads(cfg_resp.read().decode("utf-8"))
+        except Exception:
+            if not isinstance(config, dict):
+                config = {}
 
-    quant_cfg = config.get("quantization_config")
-    quantization = None
-    quantization_bits = None
+    return model_info, config
+
+
+def inspect_model_attributes(
+    model_info: Dict[str, Any], config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Extracts architecture, quantization, context, and size attributes."""
+    attrs: Dict[str, Any] = {}
+
+    # Architectures
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    attrs["architectures"] = architectures
+    attrs["model_type"] = config.get("model_type", "")
+
+    # Context length
+    ctx = (
+        config.get("max_position_embeddings")
+        or config.get("seq_length")
+        or config.get("max_sequence_length")
+        or config.get("n_positions")
+    )
+    attrs["context_length"] = int(ctx) if ctx and str(ctx).isdigit() else None
+
+    # Native torch dtype
+    attrs["torch_dtype"] = config.get("torch_dtype")
+
+    # Quantization detection
+    quant_cfg = config.get("quantization_config") or {}
+    quant_method = None
     if isinstance(quant_cfg, dict):
-        quantization = (
-            quant_cfg.get("quant_method")
-            or quant_cfg.get("quantization_method")
-            or quant_cfg.get("method")
-        )
-        bits = quant_cfg.get("bits")
-        if isinstance(bits, int):
-            quantization_bits = bits
-    if quantization is None:
-        tags = [str(tag).lower() for tag in api.get("tags", []) if tag]
-        for candidate in ("awq", "gptq", "bitsandbytes", "bnb", "int8"):
-            if candidate in tags:
-                quantization = "bnb_4bit" if candidate == "bnb" else candidate
-                break
+        quant_method = quant_cfg.get("quant_method") or quant_cfg.get("quant_type")
+    if not quant_method:
+        # Check tags or model ID string heuristics as fallback
+        tags = model_info.get("tags") or []
+        tag_str = " ".join(tags).lower()
+        model_id_lower = model_info.get("id", "").lower()
+        if "awq" in tag_str or "awq" in model_id_lower:
+            quant_method = "awq"
+        elif "gptq" in tag_str or "gptq" in model_id_lower:
+            quant_method = "gptq"
+        elif "fp8" in tag_str or "fp8" in model_id_lower:
+            quant_method = "fp8"
+        elif "bitsandbytes" in tag_str or "bnb" in model_id_lower:
+            quant_method = "bitsandbytes"
 
-    context_length = None
-    for key in ("max_position_embeddings", "max_sequence_length", "model_max_length", "seq_length"):
-        value = config.get(key)
-        if isinstance(value, int) and value > 0:
-            context_length = value
+    attrs["quantization_method"] = str(quant_method).lower() if quant_method else None
+
+    # Parameter count
+    param_count = None
+    safetensors = model_info.get("safetensors")
+    if isinstance(safetensors, dict) and "total" in safetensors:
+        try:
+            param_count = int(safetensors["total"])
+        except (ValueError, TypeError):
+            pass
+
+    if param_count is None:
+        # Check num_parameters in config
+        n_params = config.get("num_parameters")
+        if n_params and str(n_params).isdigit():
+            param_count = int(n_params)
+
+    if param_count is None:
+        # Heuristic extraction from model ID (e.g. 7b, 30b, 0.5b)
+        m = re.search(r"[-_]([0-9]+(?:\.[0-9]+)?)[bB][-_]?", model_info.get("id", ""))
+        if m:
+            try:
+                param_count = int(float(m.group(1)) * 1_000_000_000)
+            except ValueError:
+                pass
+
+    attrs["param_count"] = param_count
+
+    # Remote code check
+    auto_map = config.get("auto_map")
+    attrs["requires_remote_code"] = bool(auto_map)
+
+    # Gated check
+    attrs["gated"] = bool(model_info.get("gated", False))
+
+    return attrs
+
+
+def validate_compatibility(
+    model_id: str,
+    attrs: Dict[str, Any],
+    gpu_info: Dict[str, Any],
+    user_overrides: Dict[str, Any],
+) -> List[str]:
+    """
+    Validates model compatibility against dual Tesla T4 constraints and vLLM.
+    Returns list of fatal error messages (empty if compatible).
+    """
+    errors: List[str] = []
+
+    archs = attrs.get("architectures", [])
+    model_type = attrs.get("model_type", "").lower()
+    quant_method = user_overrides.get("quantization") or attrs.get(
+        "quantization_method"
+    )
+    param_count = attrs.get("param_count")
+
+    # 1. Architecture Validation
+    has_unsupported = False
+    for arch in archs:
+        arch_lower = arch.lower()
+        if any(re.match(pat, arch_lower) for pat in UNSUPPORTED_ARCH_PATTERNS):
+            has_unsupported = True
             break
 
-    torch_dtype = config.get("torch_dtype")
-    if not isinstance(torch_dtype, str):
-        torch_dtype = None
-
-    gated = bool(api.get("gated")) or bool(api.get("private"))
-    auto_map = config.get("auto_map")
-    trust_remote_code = bool(auto_map) or bool(config.get("custom_code"))
-    pipeline_tag = api.get("pipeline_tag") if isinstance(api.get("pipeline_tag"), str) else None
-
-    return ModelMetadata(
-        model_id=model_id,
-        model_type=str(config.get("model_type")) if config.get("model_type") else None,
-        architectures=architectures,
-        parameter_count=parameter_count,
-        quantization=str(quantization) if quantization else None,
-        quantization_bits=quantization_bits,
-        torch_dtype=torch_dtype,
-        context_length=context_length,
-        gated=gated,
-        trust_remote_code=trust_remote_code,
-        pipeline_tag=pipeline_tag,
-    )
-
-
-def urllib_parse_quote(value: str, safe: str = "") -> str:
-    # Tiny local alias to keep the module dependency-free.
-    from urllib.parse import quote
-
-    return quote(value, safe=safe)
-
-
-# Keep the call site compact and monkeypatch-friendly for tests.
-urllib = type("_Urllib", (), {"parse_quote": staticmethod(urllib_parse_quote)})
-
-
-def query_hardware() -> Hardware:
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,compute_cap,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+    if has_unsupported:
+        errors.append(
+            f"Architecture '{archs}' is not a supported causal language model for vLLM text generation. "
+            "Encoder-only, classification, diffusion, vision, and non-text architectures cannot be served."
         )
-    except FileNotFoundError as exc:
-        raise PreflightError("nvidia-smi is not available. Enable a Kaggle GPU accelerator.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise PreflightError("nvidia-smi failed. Verify that NVIDIA drivers/CUDA are available.") from exc
+    else:
+        # Check against known supported causal LM architectures
+        has_supported = False
+        for arch in archs:
+            arch_lower = arch.lower()
+            if any(re.match(pat, arch_lower) for pat in SUPPORTED_CAUSAL_PATTERNS):
+                has_supported = True
+                break
 
-    names: List[str] = []
-    caps: List[str] = []
-    total_mib = 0.0
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 3:
-            continue
-        names.append(parts[0])
-        caps.append(parts[1])
-        try:
-            total_mib += float(parts[2])
-        except ValueError:
-            pass
-    if not names:
-        raise PreflightError("No NVIDIA GPUs detected.")
+        # Fall back to checking model_type against supported patterns
+        if not has_supported and model_type:
+            if any(re.match(pat, model_type) for pat in SUPPORTED_CAUSAL_PATTERNS):
+                has_supported = True
 
-    return Hardware(
-        gpu_count=len(names),
-        gpu_names=names,
-        compute_capabilities=caps,
-        total_vram_gb=total_mib / 1024.0,
-    )
+        if not has_supported:
+            if archs:
+                errors.append(
+                    f"Architecture '{archs}' is unrecognized. Unable to verify causal LM compatibility "
+                    "with vLLM. To prevent silent deployment failures, automatic preflight fails closed. "
+                    "Verify this model is a supported autoregressive causal language model."
+                )
+            elif not model_type:
+                errors.append(
+                    f"Model '{model_id}' does not specify architectures or model_type in config.json. "
+                    "Unable to verify causal LM compatibility with vLLM."
+                )
+            else:
+                errors.append(
+                    f"Model type '{model_type}' is unrecognized. Unable to verify causal LM compatibility with vLLM."
+                )
 
-
-def estimate_weight_gb(parameters: Optional[int], quantization: Optional[str], bits: Optional[int]) -> Optional[float]:
-    if not parameters:
-        return None
-    effective_bits = bits
-    if effective_bits is None and quantization:
-        normalized = quantization.lower()
-        if normalized in {"awq", "gptq", "bnb_4bit", "bitsandbytes"}:
-            effective_bits = 4
-        elif normalized in {"int8", "bnb_8bit"}:
-            effective_bits = 8
-    bytes_per_param = (effective_bits / 8.0) if effective_bits else 2.0
-    # Conservative overhead allowance for scales/metadata/allocator/KV cache.
-    return parameters * bytes_per_param * 1.20 / (1024 ** 3)
-
-
-def resolve_config(metadata: ModelMetadata, hardware: Hardware) -> Dict[str, Any]:
-    model_id = env_value("MODEL_ID") or metadata.model_id
-    served = env_value("SERVED_MODEL_NAME") or model_id.rsplit("/", 1)[-1].lower().replace("_", "-")
-
-    tp_override = parse_int(env_value("TENSOR_PARALLEL_SIZE"), "TENSOR_PARALLEL_SIZE")
-    max_len_override = parse_int(env_value("MAX_MODEL_LEN"), "MAX_MODEL_LEN")
-    max_seqs_override = parse_int(env_value("MAX_NUM_SEQS"), "MAX_NUM_SEQS")
-    gpu_mem_override = parse_float(env_value("GPU_MEMORY_UTILIZATION"), "GPU_MEMORY_UTILIZATION", 0.5, 0.95)
-    dtype_override = env_value("DTYPE")
-    quant_override = env_value("QUANTIZATION")
-    trust_override = parse_bool(env_value("TRUST_REMOTE_CODE"), "TRUST_REMOTE_CODE")
-
-    dtype = dtype_override or DEFAULT_DTYPE
-    if dtype.lower() == "bfloat16":
-        raise PreflightError("DTYPE=bfloat16 is rejected on Turing T4. Use float16 instead.")
-    if dtype.lower() == "fp8":
-        raise PreflightError("DTYPE=fp8 is rejected on Turing T4. Use float16 or a supported quantization mode.")
-
-    quantization = quant_override or metadata.quantization
-    if quantization and quantization.lower() in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
-        raise PreflightError("FP8 quantization is incompatible with T4 (Turing CC 7.5). Use AWQ/GPTQ/another T4-compatible format.")
-
-    tp = tp_override or DEFAULT_TP
-    if tp > hardware.gpu_count:
-        raise PreflightError(
-            f"TENSOR_PARALLEL_SIZE={tp} exceeds available GPU count ({hardware.gpu_count})."
-        )
-    if hardware.gpu_count != 2:
-        raise PreflightError(
-            f"This deployment profile targets dual T4 GPUs, but {hardware.gpu_count} GPU(s) were detected. "
-            "Use the existing Qwen profile or explicitly adapt the hardware assumptions before deploying."
-        )
-    if any("T4" not in name.upper() for name in hardware.gpu_names):
-        raise PreflightError(
-            "The generic Kaggle profile is constrained to NVIDIA Tesla T4 GPUs. "
-            f"Detected: {', '.join(hardware.gpu_names)}."
+    # 2. Hardware: FP8 Quantization on Tesla T4
+    if quant_method == "fp8":
+        errors.append(
+            "Model uses FP8 quantization. NVIDIA Tesla T4 (Turing, Compute Capability 7.5) does not "
+            "possess FP8 tensor cores (FP8 requires Ada Lovelace CC 8.9+ or Hopper CC 9.0+). "
+            "Please select an AWQ, GPTQ, or unquantized 16-bit model."
         )
 
-    max_len = max_len_override or min(metadata.context_length or DEFAULT_MAX_MODEL_LEN, DEFAULT_MAX_MODEL_LEN)
+    # 3. Hardware: Tensor Parallel Size vs Available GPUs
+    tp_size = user_overrides.get("tensor_parallel_size")
+    if tp_size is None:
+        tp_size = DEFAULT_TENSOR_PARALLEL_SIZE
+    if tp_size <= 0:
+        errors.append(f"Invalid tensor_parallel_size ({tp_size}). Must be >= 1.")
+    elif gpu_info["available"] and gpu_info["count"] < tp_size:
+        errors.append(
+            f"Requested tensor_parallel_size ({tp_size}) exceeds detected GPU count ({gpu_info['count']}). "
+            "Dual T4 requires 2 GPUs; verify accelerator setting 'GPU T4 x2' in Kaggle."
+        )
+
+    # 4. Hardware: VRAM Footprint Estimation (Heuristic Safety Policy)
+    if param_count and param_count > 0:
+        params_billions = param_count / 1_000_000_000.0
+
+        if not quant_method:
+            # Unquantized 16-bit (~2.0 bytes per parameter)
+            est_vram_gb = params_billions * 2.0
+            if est_vram_gb > DUAL_T4_TOTAL_VRAM_GB:
+                errors.append(
+                    f"Model parameter count (~{params_billions:.1f}B) in unquantized 16-bit requires "
+                    f"~{est_vram_gb:.1f} GB VRAM for weights alone, which exceeds the total usable VRAM "
+                    f"of Kaggle dual Tesla T4s (~{DUAL_T4_TOTAL_VRAM_GB:.1f} GB). "
+                    "Remediation: Choose an AWQ or GPTQ 4-bit quantized version of this model."
+                )
+        elif quant_method in ("awq", "gptq"):
+            # 4-bit quantization (~0.55-0.65 bytes per parameter)
+            est_vram_gb = params_billions * 0.6
+            if est_vram_gb > (DUAL_T4_TOTAL_VRAM_GB * 0.85):
+                errors.append(
+                    f"Quantized 4-bit model (~{params_billions:.1f}B parameters) requires estimated "
+                    f"~{est_vram_gb:.1f} GB VRAM, exceeding dual T4 capacity with safety margins. "
+                    "Models larger than 32B typically cannot fit on dual Tesla T4s."
+                )
+
+    # 5. Context Length Validation
+    max_len = user_overrides.get("max_model_len")
+    if max_len is None:
+        max_len = DEFAULT_MAX_MODEL_LEN
     if max_len < 128:
-        raise PreflightError("MAX_MODEL_LEN must be at least 128 tokens for this workflow.")
-    max_seqs = max_seqs_override or DEFAULT_MAX_NUM_SEQS
-    gpu_mem = gpu_mem_override or DEFAULT_GPU_MEMORY_UTILIZATION
-    trust_remote_code = trust_override if trust_override is not None else metadata.trust_remote_code
+        errors.append(f"Invalid max_model_len ({max_len}). Must be >= 128.")
 
-    estimated_weight_gb = estimate_weight_gb(
-        metadata.parameter_count, quantization, metadata.quantization_bits
+    return errors
+
+
+def resolve_configuration(
+    model_id: str,
+    attrs: Dict[str, Any],
+    user_overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Resolves final vLLM execution arguments using precedence:
+      User Overrides -> Model Metadata -> Safe Defaults
+    """
+    # Served model name
+    served_name = (
+        user_overrides.get("served_model_name")
+        or sanitize_served_name(model_id)
     )
-    if estimated_weight_gb is not None:
-        bits = metadata.quantization_bits
-        normalized_quant = (quantization or "").lower()
-        effective_4bit = bits == 4 or normalized_quant in {"awq", "gptq", "bnb_4bit", "bitsandbytes"}
-        if effective_4bit and estimated_weight_gb > 30.0:
-            raise PreflightError(
-                f"Estimated 4-bit footprint is about {estimated_weight_gb:.1f} GB, exceeding the 30 GB profile. "
-                "Choose a smaller model or a stronger quantization.")
-        if not effective_4bit and metadata.parameter_count and metadata.parameter_count > 14_000_000_000:
-            raise PreflightError(
-                "Unquantized models above 14B parameters are rejected for the dual-T4 30 GB profile. "
-                "Use a quantized checkpoint or smaller model.")
+
+    # Tensor parallel size
+    tp = user_overrides.get("tensor_parallel_size")
+    if tp is None:
+        tp = DEFAULT_TENSOR_PARALLEL_SIZE
+
+    # Quantization
+    quant = user_overrides.get("quantization") or attrs.get("quantization_method")
+    if quant and quant.lower() in ("none", "null", "false", ""):
+        quant = None
+
+    # DType: Tesla T4 must use float16 by default because CC 7.5 lacks hardware bfloat16
+    dtype = user_overrides.get("dtype")
+    if not dtype:
+        dtype = DEFAULT_DTYPE
+
+    # Max Model Length
+    native_ctx = attrs.get("context_length")
+    max_len = user_overrides.get("max_model_len")
+    if max_len is None:
+        max_len = DEFAULT_MAX_MODEL_LEN
+    if native_ctx and native_ctx < max_len:
+        # Bound to native context length if smaller
+        max_len = native_ctx
+
+    # Concurrency and GPU memory utilization
+    max_seqs = user_overrides.get("max_num_seqs")
+    if max_seqs is None:
+        max_seqs = DEFAULT_MAX_NUM_SEQS
+
+    gpu_mem = user_overrides.get("gpu_memory_utilization")
+    if gpu_mem is None:
+        gpu_mem = DEFAULT_GPU_MEMORY_UTILIZATION
+
+    # Enforce eager: T4 benefits heavily from --enforce-eager to avoid CUDA graph VRAM overhead
+    enforce_eager = user_overrides.get("enforce_eager")
+    if enforce_eager is None:
+        enforce_eager = DEFAULT_ENFORCE_EAGER
+
+    # Trust remote code precedence:
+    # 1. User override (explicit True/False)
+    # 2. Model metadata (requires_remote_code / auto_map in config)
+    # 3. Default: False (do not blindly enable when unnecessary)
+    trust_remote = user_overrides.get("trust_remote_code")
+    if trust_remote is None:
+        trust_remote = bool(attrs.get("requires_remote_code", False))
+
+    # Build exact vllm CLI arguments
+    cmd_args: List[str] = [
+        "vllm",
+        "serve",
+        model_id,
+        "--served-model-name",
+        served_name,
+        "--host",
+        DEFAULT_HOST,
+        "--port",
+        str(DEFAULT_PORT),
+        "--tensor-parallel-size",
+        str(tp),
+        "--dtype",
+        str(dtype),
+        "--max-model-len",
+        str(max_len),
+        "--max-num-seqs",
+        str(max_seqs),
+        "--gpu-memory-utilization",
+        str(gpu_mem),
+    ]
+
+    if quant:
+        cmd_args.extend(["--quantization", str(quant)])
+
+    if enforce_eager:
+        cmd_args.append("--enforce-eager")
+
+    if trust_remote:
+        cmd_args.append("--trust-remote-code")
 
     return {
+        "status": "PASS",
         "model_id": model_id,
-        "served_model_name": served,
+        "served_model_name": served_name,
         "tensor_parallel_size": tp,
         "dtype": dtype,
-        "quantization": quantization,
+        "quantization": quant,
         "max_model_len": max_len,
         "max_num_seqs": max_seqs,
         "gpu_memory_utilization": gpu_mem,
-        "trust_remote_code": trust_remote_code,
-        "host": env_value("VLLM_HOST") or DEFAULT_HOST,
-        "port": parse_int(env_value("VLLM_PORT"), "VLLM_PORT") or DEFAULT_PORT,
-        "vllm_version": VLLM_VERSION,
-        "estimated_weight_gb": estimated_weight_gb,
+        "enforce_eager": enforce_eager,
+        "trust_remote_code": trust_remote,
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "command_args": cmd_args,
+        "command_str": " ".join(f"'{a}'" if " " in a else a for a in cmd_args),
     }
 
 
-def validate_architecture(metadata: ModelMetadata) -> None:
-    joined = " ".join(metadata.architectures)
-    lower = joined.lower()
-    for marker in UNSUPPORTED_ARCH_MARKERS:
-        if marker.lower() in lower:
-            raise PreflightError(
-                f"Architecture {joined or metadata.model_type or 'unknown'} is outside the causal-LM deployment profile. "
-                "Choose a vLLM-supported text generation / causal model."
-            )
-    if metadata.pipeline_tag:
-        pipeline = metadata.pipeline_tag.lower()
-        if any(value in pipeline for value in ("text-classification", "image-classification", "audio", "diffusion", "feature-extraction")):
-            raise PreflightError(
-                f"Hugging Face pipeline_tag={metadata.pipeline_tag!r} is not a text-generation workload for this workflow."
-            )
-    if metadata.architectures and not any(marker in joined for marker in SUPPORTED_CAUSAL_MARKERS):
-        raise PreflightError(
-            f"Could not confirm a causal/conditional generation architecture from {metadata.architectures}. "
-            "Choose a vLLM-supported generative model or provide a model-specific profile."
-        )
+def print_diagnostic_report(
+    model_id: str,
+    attrs: Dict[str, Any],
+    gpu_info: Dict[str, Any],
+    resolved: Dict[str, Any],
+    hf_token: Optional[str],
+) -> None:
+    """Prints a clean human-readable diagnostic report to stderr/stdout."""
+    p = sys.stderr.write
+    p("\n" + "=" * 64 + "\n")
+    p(" RELAY KAGGLE DEPLOYMENT PREFLIGHT REPORT\n")
+    p("=" * 64 + "\n")
 
+    p(" [1] Target Hugging Face Model\n")
+    p(f"     Model ID:          {model_id}\n")
+    p(f"     Architectures:     {attrs.get('architectures') or '<not specified>'}\n")
+    p(f"     Model Type:        {attrs.get('model_type') or '<unknown>'}\n")
+    param_str = (
+        f"{attrs['param_count'] / 1e9:.2f}B"
+        if attrs.get("param_count")
+        else "Unknown / unlisted"
+    )
+    p(f"     Parameter Count:   {param_str}\n")
+    p(f"     Detected Quant:    {attrs.get('quantization_method') or 'None (16-bit)'}\n")
+    p(f"     Config DType:      {attrs.get('torch_dtype') or 'Not specified'}\n")
+    p(f"     Context Length:    {attrs.get('context_length') or 'Default'}\n")
+    p(f"     Gated Repository:  {'Yes' if attrs.get('gated') else 'No'}\n")
+    p(f"     HF Token Status:   {mask_token(hf_token)}\n\n")
 
-def run(model_id: str) -> Tuple[ModelMetadata, Hardware, Dict[str, Any]]:
-    token = auth_token()
-    metadata = discover_model(model_id, token)
-    validate_architecture(metadata)
-    hardware = query_hardware()
-    if metadata.gated and not token:
-        raise PreflightError(
-            "This Hugging Face model is gated/private and no HF_TOKEN is available. "
-            "Store a token in a Kaggle Secret named HF_TOKEN and rerun."
-        )
-    config = resolve_config(metadata, hardware)
-    return metadata, hardware, config
-
-
-def command_argv(config: Dict[str, Any]) -> List[str]:
-    argv = [
-        "vllm",
-        "serve",
-        config["model_id"],
-        "--served-model-name",
-        config["served_model_name"],
-        "--tensor-parallel-size",
-        str(config["tensor_parallel_size"]),
-        "--dtype",
-        str(config["dtype"]),
-        "--max-model-len",
-        str(config["max_model_len"]),
-        "--max-num-seqs",
-        str(config["max_num_seqs"]),
-        "--gpu-memory-utilization",
-        str(config["gpu_memory_utilization"]),
-        "--host",
-        str(config["host"]),
-        "--port",
-        str(config["port"]),
-        "--enforce-eager",
-    ]
-    if config.get("quantization"):
-        argv.extend(["--quantization", str(config["quantization"])])
-    if config.get("trust_remote_code"):
-        argv.append("--trust-remote-code")
-    return argv
-
-
-def print_human(metadata: ModelMetadata, hardware: Hardware, config: Dict[str, Any]) -> None:
-    print("\n=== Relay Kaggle vLLM Preflight ===")
-    print(f"Model                : {metadata.model_id}")
-    print(f"Architecture         : {', '.join(metadata.architectures) or metadata.model_type or 'unknown'}")
-    print(f"Parameters           : {metadata.parameter_count or 'unknown'}")
-    print(f"Quantization         : {metadata.quantization or 'none detected'}")
-    print(f"Torch dtype          : {metadata.torch_dtype or 'unknown'}")
-    print(f"Context length       : {metadata.context_length or 'unknown'}")
-    print(f"Gated/private        : {'yes' if metadata.gated else 'no'}")
-    print(f"Remote code          : {'yes' if metadata.trust_remote_code else 'no'}")
-    print(f"GPU                  : {', '.join(hardware.gpu_names)}")
-    print(f"GPU count / VRAM     : {hardware.gpu_count} / {hardware.total_vram_gb:.1f} GB")
-    print(f"Tensor parallel      : {config['tensor_parallel_size']}")
-    print(f"dtype                : {config['dtype']}")
-    print(f"quantization         : {config['quantization'] or 'none'}")
-    print(f"max_model_len       : {config['max_model_len']}")
-    print(f"max_num_seqs         : {config['max_num_seqs']}")
-    print(f"gpu_memory_util      : {config['gpu_memory_utilization']}")
-    print(f"estimated weights    : {config['estimated_weight_gb']:.1f} GB" if config['estimated_weight_gb'] else "estimated weights    : unknown")
-    print(f"vLLM                 : {config['vllm_version']}")
-    print(f"served model         : {config['served_model_name']}")
-    print(f"\nvLLM command:\n  {shlex.join(command_argv(config))}")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    parser.add_argument("--model-id", default=None, help="Optional MODEL_ID override")
-    args = parser.parse_args()
-
-    if args.model_id:
-        os.environ["MODEL_ID"] = args.model_id
-    model_id = env_value("MODEL_ID")
-    if not model_id:
-        print("ERROR: MODEL_ID is required.", file=sys.stderr)
-        return 2
-
-    try:
-        metadata, hardware, config = run(model_id)
-    except PreflightError as exc:
-        print(f"PREFLIGHT FAILED: {exc}", file=sys.stderr)
-        return 1
-
-    payload = {
-        "metadata": asdict(metadata),
-        "hardware": asdict(hardware),
-        "config": config,
-        "command": command_argv(config),
-        "hf_token_present": bool(auth_token()),
-    }
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
+    p(" [2] Hardware Environment\n")
+    if gpu_info["available"]:
+        p(f"     GPU Count:         {gpu_info['count']}\n")
+        for dev in gpu_info["devices"]:
+            p(f"       - GPU {dev['index']}: {dev['name']} ({dev['memory_mb']:.0f} MiB)\n")
+        p(f"     Total VRAM:        {gpu_info['total_vram_gb']} GB\n")
+        p(f"     Hardware Class:    {'NVIDIA Tesla T4 (Turing CC 7.5)' if gpu_info['is_tesla_t4'] else 'Custom GPU'}\n\n")
     else:
-        print_human(metadata, hardware, config)
-    return 0
+        p("     GPU Status:        No GPU detected via nvidia-smi (Local/Test mode)\n\n")
+
+    p(" [3] Resolved vLLM Configuration\n")
+    p(f"     Served Alias:      {resolved['served_model_name']}\n")
+    p(f"     Tensor Parallel:   {resolved['tensor_parallel_size']}\n")
+    p(f"     Execution DType:   {resolved['dtype']} (Safe for Turing CC 7.5)\n")
+    p(f"     Quantization:      {resolved['quantization'] or 'None'}\n")
+    p(f"     Max Model Len:     {resolved['max_model_len']}\n")
+    p(f"     Max Num Seqs:      {resolved['max_num_seqs']}\n")
+    p(f"     GPU Memory Util:   {resolved['gpu_memory_utilization']}\n")
+    p(f"     Enforce Eager:     {resolved['enforce_eager']}\n")
+    p(f"     Trust Remote Code: {resolved['trust_remote_code']}\n\n")
+
+    p(" [4] Generated vLLM Execution Command\n")
+    p(f"     {resolved['command_str']}\n")
+    p("=" * 64 + "\n\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Relay vLLM Preflight & Compatibility Inspector"
+    )
+    parser.add_argument(
+        "--model-id",
+        default=os.environ.get("MODEL_ID"),
+        help="Target Hugging Face Model ID (e.g., Qwen/Qwen2.5-Coder-7B-Instruct)",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        default=os.environ.get("SERVED_MODEL_NAME"),
+        help="Served model alias name for OpenAI API routing",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=int(os.environ.get("TENSOR_PARALLEL_SIZE", DEFAULT_TENSOR_PARALLEL_SIZE)),
+        help="Tensor parallelism degree across GPUs (default: 2)",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=int(os.environ.get("MAX_MODEL_LEN", DEFAULT_MAX_MODEL_LEN)),
+        help="Maximum model context length (default: 4096)",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=int(os.environ.get("MAX_NUM_SEQS", DEFAULT_MAX_NUM_SEQS)),
+        help="Maximum number of concurrent sequences (default: 4)",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=float(
+            os.environ.get("GPU_MEMORY_UTILIZATION", DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
+        help="Fraction of VRAM reserved for vLLM (default: 0.85)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default=os.environ.get("DTYPE"),
+        help="Precision dtype override (e.g., float16)",
+    )
+    parser.add_argument(
+        "--quantization",
+        default=os.environ.get("QUANTIZATION"),
+        help="Quantization method override (e.g., awq, gptq)",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        default=os.environ.get("TRUST_REMOTE_CODE"),
+        help="Whether to pass --trust-remote-code (true/false)",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Hugging Face access token for gated models",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit clean JSON to stdout for programmatic consumption by vllm.sh",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    model_id = args.model_id
+    if not model_id or not model_id.strip():
+        err_msg = "MODEL_ID is required. Provide --model-id or export MODEL_ID in your environment."
+        if args.json:
+            print(json.dumps({"status": "FAIL", "error": err_msg}))
+        else:
+            sys.stderr.write(f"PREFLIGHT ERROR: {err_msg}\n")
+        sys.exit(1)
+
+    model_id = model_id.strip()
+
+    # User overrides dictionary
+    user_overrides: Dict[str, Any] = {
+        "served_model_name": args.served_model_name,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "dtype": args.dtype,
+        "quantization": args.quantization,
+    }
+
+    if args.trust_remote_code is not None:
+        user_overrides["trust_remote_code"] = str(
+            args.trust_remote_code
+        ).lower() in ("true", "1", "yes")
+
+    # Step 1: Query Hugging Face Hub
+    try:
+        model_info, config = fetch_hf_model_metadata(model_id, args.hf_token)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"status": "FAIL", "error": str(e)}))
+        else:
+            sys.stderr.write(f"\n[PREFLIGHT FAILED] Hugging Face Discovery: {e}\n")
+        sys.exit(1)
+
+    # Step 2: Inspect attributes & Detect Hardware
+    attrs = inspect_model_attributes(model_info, config)
+    gpu_info = detect_gpus()
+
+    # Step 3: Compatibility Validation
+    errors = validate_compatibility(model_id, attrs, gpu_info, user_overrides)
+    if errors:
+        error_summary = " | ".join(errors)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "error": error_summary,
+                        "errors": errors,
+                        "model_id": model_id,
+                    }
+                )
+            )
+        else:
+            sys.stderr.write("\n" + "!" * 64 + "\n")
+            sys.stderr.write(" PREFLIGHT COMPATIBILITY VALIDATION FAILED\n")
+            sys.stderr.write("!" * 64 + "\n")
+            for err in errors:
+                sys.stderr.write(f" - {err}\n")
+            sys.stderr.write("\nAutomatic deployment halted for safety.\n\n")
+        sys.exit(1)
+
+    # Step 4: Resolve Configuration
+    resolved = resolve_configuration(model_id, attrs, user_overrides)
+
+    if args.json:
+        # Output ONLY JSON to stdout
+        print(json.dumps(resolved, indent=2))
+    else:
+        # Output human diagnostic report
+        print_diagnostic_report(model_id, attrs, gpu_info, resolved, args.hf_token)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

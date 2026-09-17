@@ -184,15 +184,27 @@ pnpm build
 
 ---
 
-## Self-Hosted Qwen on Kaggle
+## Self-Hosted Models on Kaggle (vLLM)
 
-Relay includes a reproducible, turn-key runbook for running **Qwen3-Coder-30B-A3B-Instruct** via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs in Kaggle and exposing it securely to Relay over an encrypted Cloudflare Quick Tunnel.
+Relay includes reproducible, turn-key deployment workflows for running open-weights LLMs via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs in Kaggle and exposing them securely to Relay over an encrypted Cloudflare Quick Tunnel.
+
+### 1. Generic vLLM Kaggle Deployment
+
+Deploy any supported Hugging Face model (e.g. Qwen2.5, Llama 3, Mistral) by specifying `MODEL_ID` in a single configuration cell with automated hardware preflight validation.
+
+- **GitHub Source Notebook**: [notebooks/vllm-kaggle.ipynb](notebooks/vllm-kaggle.ipynb) (parameter-driven self-service deployment)
+- **Deployment Runbook**: [docs/kaggle-vllm.md](docs/kaggle-vllm.md) (hardware limits, overrides, preflight guide)
+- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`vllm.sh`, `preflight.py`, `cloudflared.sh`, `diagnostics.sh`)
+
+### 2. Qwen Reference Deployment
+
+A production-tested reference deployment for **Qwen3-Coder-30B-A3B-Instruct** (30.5B MoE, AWQ 4-bit) tuned specifically for dual Tesla T4s.
 
 [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm)
 
 - **Published Kaggle Notebook**: [kaggle.com/code/mosabbir-maruf/qwen-vllm](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm) (interactive 1-click cloud execution)
 - **GitHub Source Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb) (version-controlled repository source)
-- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md) (step-by-step operational guide & troubleshooting)
+- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md) (step-by-step operational runbook & troubleshooting)
 - **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
 - **Gateway Configuration**: Set `QWEN_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `QWEN_MODEL=qwen3-coder-30b` in your `.env`.
 

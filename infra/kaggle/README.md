@@ -1,16 +1,23 @@
 # Relay Kaggle Infrastructure Scripts
 
-This directory contains production-tested, reproducible management scripts for deploying the self-hosted **Qwen3-Coder-30B-A3B-Instruct** model via **vLLM** on a Kaggle dual NVIDIA Tesla T4 GPU environment and exposing it securely to Relay over a Cloudflare Quick Tunnel.
+This directory contains production-tested, reproducible management scripts for deploying self-hosted LLM backends via **vLLM** on a Kaggle dual NVIDIA Tesla T4 GPU environment and exposing them securely to Relay over a Cloudflare Quick Tunnel.
+
+Two deployment workflows are supported:
+
+1. **Generic Hugging Face Deployment (`vllm.sh` + `preflight.py`)**: A model-agnostic, parameter-driven system capable of inspecting any compatible Hugging Face model, resolving hardware-safe execution parameters for dual Tesla T4s, and managing the server lifecycle.
+2. **Qwen Reference Deployment (`qwen-vllm.sh`)**: The stable, turn-key reference configuration for `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ`.
 
 ---
 
 ## Script Index
 
-| Script               | Purpose                                                                                        | Key Subcommands                                             |
-| :------------------- | :--------------------------------------------------------------------------------------------- | :---------------------------------------------------------- |
-| **`qwen-vllm.sh`**   | Manages vLLM background process lifecycle, health polling, local inference, and safe cleanup.  | `check`, `clean`, `start`, `status`, `test`, `logs`, `stop` |
-| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery. | `check`, `start`, `status`, `url`, `logs`, `stop`           |
-| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.       | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`   |
+| Script               | Purpose                                                                                         | Key Subcommands                                                              |
+| :------------------- | :---------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------- |
+| **`vllm.sh`**        | Generic vLLM lifecycle manager driven by environment variables and preflight resolution.        | `check`, `preflight`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop` |
+| **`preflight.py`**   | Hugging Face Hub inspector and hardware compatibility validator (standard library Python 3.8+). | `--model-id`, `--json`, `--tensor-parallel-size`, `--hf-token`               |
+| **`qwen-vllm.sh`**   | Dedicated reference manager for Qwen3-Coder-30B-AWQ.                                            | `check`, `clean`, `start`, `status`, `test`, `logs [N]`, `stop`              |
+| **`cloudflared.sh`** | Manages `cloudflared` binary download, background tunnel execution, and dynamic URL discovery.  | `check`, `start`, `status`, `url`, `logs [N]`, `stop`                        |
+| **`diagnostics.sh`** | Comprehensive 10-point system, GPU, CUDA, process, network, and tunnel diagnostic suite.        | `all`, `gpu`, `cuda`, `vllm`, `tunnel`, `network`, `logs`                    |
 
 ---
 
@@ -56,11 +63,11 @@ Git tracks standard file contents and modes, but depending on how repositories a
 
 ## Kaggle Prerequisites
 
-Before running the Relay infrastructure checks, make sure the Kaggle Notebook has a **GPU accelerator enabled** and **Internet access enabled**. The current Qwen deployment scripts target **dual NVIDIA Tesla T4 GPUs**.
+Before running the Relay infrastructure checks, make sure the Kaggle Notebook has a **GPU accelerator enabled** and **Internet access enabled**.
 
 ### Install vLLM
 
-The `qwen-vllm.sh` script expects the `vllm` CLI to already be installed. Install the version used by the verified Kaggle configuration:
+Both workflows expect the `vllm` CLI to already be installed. Install the verified version:
 
 ```python
 !python -m pip install -q --no-cache-dir "vllm==0.29.0"
@@ -78,134 +85,76 @@ Expected output:
 0.29.0
 ```
 
-> **Why this step matters:** `qwen-vllm.sh check` intentionally fails when the `vllm` binary is missing instead of silently installing dependencies. Keeping installation separate makes the runtime check predictable and makes failures easier to diagnose.
+> **Why this step matters:** `vllm.sh check` and `qwen-vllm.sh check` intentionally fail when the `vllm` binary is missing instead of silently installing unpinned dependencies. Keeping installation separate makes runtime checks predictable and failures easier to diagnose.
 
 ---
 
-## Recommended Execution Sequence
+## Workflow 1: Generic Hugging Face Model Deployment
 
-Run each group below in a **separate Kaggle Code cell**. Each shell-command cell starts with `%%bash` unless noted otherwise.
-
-### 1. Preflight check
+The generic workflow allows you to deploy any compatible causal language model simply by setting `MODEL_ID`:
 
 ```bash
 %%bash
 cd /kaggle/working/Relay
-./infra/kaggle/qwen-vllm.sh check
-```
+export MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
+export SERVED_MODEL_NAME="qwen2.5-coder-7b"
 
-Checks the GPU environment, vLLM CLI, and port 8000 before starting anything.
+# 1. Preflight validation
+./infra/kaggle/vllm.sh preflight
 
-### 2. Full diagnostic sweep
+# 2. Cleanup stale listeners
+./infra/kaggle/vllm.sh clean
 
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/diagnostics.sh all
-```
+# 3. Launch server in background
+./infra/kaggle/vllm.sh start
 
-Detects existing processes, port conflicts, CUDA/GPU issues, networking state, and tunnel state.
+# 4. Check readiness
+./infra/kaggle/vllm.sh status
 
-### 3. Clean up stale listeners
+# 5. Smoke test local inference
+./infra/kaggle/vllm.sh test
 
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/qwen-vllm.sh clean
-```
-
-### 4. Launch vLLM
-
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/qwen-vllm.sh start
-```
-
-The script starts vLLM in the background using tensor parallelism across the two T4 GPUs.
-
-### 5. Check server readiness
-
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/qwen-vllm.sh status
-```
-
-Weight loading and KV-cache initialization may take a few minutes.
-
-### 6. Smoke test local inference
-
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/qwen-vllm.sh test
-```
-
-This verifies that the local OpenAI-compatible endpoint can actually generate a response.
-
-### 7. Verify `cloudflared`
-
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/cloudflared.sh check
-```
-
-### 8. Start the Cloudflare Quick Tunnel
-
-```bash
-%%bash
-cd /kaggle/working/Relay
+# 6. Expose over Cloudflare Quick Tunnel
 ./infra/kaggle/cloudflared.sh start
 ```
 
-The command starts the tunnel in the background and exposes the local API through a temporary public URL.
+### Preflight Compatibility & Hardware Policy
 
-### 9. Inspect tunnel diagnostics
+The preflight validator (`preflight.py`) inspects model metadata via the official Hugging Face Hub API and validates:
 
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/diagnostics.sh tunnel
-```
-
-### 10. Clean shutdown
-
-Run these when you are finished with the Kaggle session:
-
-```bash
-%%bash
-cd /kaggle/working/Relay
-./infra/kaggle/cloudflared.sh stop
-./infra/kaggle/qwen-vllm.sh stop
-```
+- **Architecture Support**: Rejects non-causal LM architectures (encoder-only, classification, diffusion, audio).
+- **T4 Hardware Precision**: Enforces `float16` by default. Rejects FP8 models because Tesla T4 (Turing CC 7.5) lacks FP8 tensor cores.
+- **VRAM Heuristic**: Estimates total parameter footprint against dual Tesla T4 capacity (~30 GB usable VRAM). Rejects unquantized models > 14B and 4-bit models > 32B with actionable guidance.
+- **Gated Models**: Checks whether model repository is gated/private and verifies that `HF_TOKEN` is present without logging raw secrets.
 
 ---
 
-## Verified Configuration
+## Workflow 2: Qwen3-Coder Reference Deployment
 
-The scripts implement the exact configuration verified on Kaggle dual NVIDIA Tesla T4 GPUs:
+The Qwen reference workflow provides a fixed, pre-tested configuration for `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ`:
 
 ```bash
-MODEL_ID="QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-SERVED_MODEL_NAME="qwen3-coder-30b"
-TENSOR_PARALLEL_SIZE="2"
-DTYPE="float16"
-QUANTIZATION="awq"
-MAX_MODEL_LEN="4096"
-MAX_NUM_SEQS="4"
-GPU_MEMORY_UTILIZATION="0.85"
-HOST="0.0.0.0"
-PORT="8000"
+%%bash
+cd /kaggle/working/Relay
+
+# 1. Hardware & port check
+./infra/kaggle/qwen-vllm.sh check
+
+# 2. Cleanup stale listeners
+./infra/kaggle/qwen-vllm.sh clean
+
+# 3. Launch Qwen vLLM server
+./infra/kaggle/qwen-vllm.sh start
+
+# 4. Check readiness
+./infra/kaggle/qwen-vllm.sh status
+
+# 5. Local inference test
+./infra/kaggle/qwen-vllm.sh test
+
+# 6. Expose over Cloudflare Quick Tunnel
+./infra/kaggle/cloudflared.sh start
 ```
-
-### Key Design Rationale
-
-- **`vllm serve`**: Canonical CLI entrypoint. (Never use obsolete `vllm server`).
-- **Single Served Name**: `--served-model-name qwen3-coder-30b`. Comma-separated names are parsed by vLLM as a single literal compound string.
-- **No `--swap-space`**: This flag is unsupported in vLLM 0.29.0 on Kaggle and must be omitted.
-- **CUDA 13 Path**: Automatically prepends `/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib` to `LD_LIBRARY_PATH` to resolve `libcudart.so.13` dependencies.
 
 ---
 
@@ -223,14 +172,30 @@ Because `WORK_DIR` defaults to `/kaggle/working`, all operational logs and PIDs 
 
 ---
 
+## Clean Shutdown
+
+Run these when you are finished with the Kaggle session to free GPU memory:
+
+```bash
+%%bash
+cd /kaggle/working/Relay
+./infra/kaggle/cloudflared.sh stop
+./infra/kaggle/vllm.sh stop
+```
+
+---
+
 ## Troubleshooting Quick Reference
 
 | Issue                              | Diagnostic / Remediation                                                                |
 | :--------------------------------- | :-------------------------------------------------------------------------------------- |
-| **`vllm` not found**               | Run the `Install vLLM` prerequisite above, then verify with `!vllm --version`.          |
-| **GPU out of memory**              | Run `./infra/kaggle/qwen-vllm.sh clean` then check `nvidia-smi`.                        |
-| **Port 8000 occupied**             | Run `./infra/kaggle/qwen-vllm.sh clean`.                                                |
-| **Weights still loading**          | Run `./infra/kaggle/qwen-vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`. |
-| **Tunnel URL missing**             | Run `./infra/kaggle/cloudflared.sh logs 30`.                                            |
+| **`vllm` not found**               | Run `!python -m pip install -q --no-cache-dir "vllm==0.29.0"`.                          |
+| **Preflight Failed (Oversized)**   | Model exceeds dual T4 VRAM. Select an AWQ/GPTQ 4-bit quantized version or model <= 14B. |
+| **Preflight Failed (FP8)**         | Tesla T4 lacks FP8 hardware. Select AWQ, GPTQ, or FP16 models.                          |
+| **Preflight Failed (Gated)**       | Model requires HF license agreement. Export `HF_TOKEN` from Kaggle Secrets.             |
+| **GPU out of memory**              | Run `./infra/kaggle/vllm.sh clean` or `./infra/kaggle/qwen-vllm.sh clean`.              |
+| **Port 8000 occupied**             | Run `./infra/kaggle/vllm.sh clean`.                                                     |
+| **Weights still loading**          | Run `./infra/kaggle/vllm.sh logs 50` or `tail -f /kaggle/working/vllm_server.log`.      |
+| **Tunnel URL missing**             | Run `./infra/kaggle/cloudflared.sh logs 30`. Verify internet is enabled in Kaggle.      |
 | **Full Stack Health**              | Run `./infra/kaggle/diagnostics.sh all`.                                                |
 | **Python `SyntaxError` in Kaggle** | Ensure Bash commands are inside a `%%bash` cell instead of a normal Python cell.        |

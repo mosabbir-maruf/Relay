@@ -96,10 +96,16 @@ start_tunnel() {
     echo -e "\n========================================================"
     echo "SUCCESS: Cloudflare Quick Tunnel is LIVE!"
     echo "Public URL: ${tunnel_url}"
+    echo "Base URL:   ${tunnel_url}/v1"
     echo "========================================================"
-    echo -e "\nConfigure Relay in your local .env:"
-    echo "QWEN_BASE_URL=${tunnel_url}/v1"
-    echo "QWEN_MODEL=qwen3-coder-30b"
+    echo "PUBLIC_URL=${tunnel_url}"
+    echo "BASE_URL=${tunnel_url}/v1"
+    if [ -n "${SERVED_MODEL_NAME:-}" ]; then
+      echo "MODEL=${SERVED_MODEL_NAME}"
+    elif [ -n "${QWEN_MODEL:-}" ]; then
+      echo "QWEN_BASE_URL=${tunnel_url}/v1"
+      echo "QWEN_MODEL=${QWEN_MODEL}"
+    fi
   else
     echo "WARNING: Tunnel process started (PID ${pid}), but URL not detected yet."
     echo "Check logs with: tail -n 20 ${LOG_FILE}"
