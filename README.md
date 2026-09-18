@@ -184,32 +184,19 @@ pnpm build
 
 ---
 
-## Self-Hosted Models on Kaggle (vLLM)
+## Self-Hosted Models (vLLM & OpenAI-Compatible)
 
-Relay includes reproducible, turn-key deployment workflows for running open-weights LLMs via **vLLM 0.29.0** on dual NVIDIA Tesla T4 GPUs in Kaggle and exposing them securely to Relay over an encrypted Cloudflare Quick Tunnel.
+Relay supports any self-hosted LLM inference backend adhering to the OpenAI REST API specification (`/v1/chat/completions` and `/v1/models`). This includes local runtimes (vLLM, Ollama, LM Studio), cloud GPUs (RunPod, Lambda Labs, Vast.ai), and containerized deployments.
 
-### 1. Generic vLLM Kaggle Deployment
+### Turn-Key Deployment via Kaggle LLM Deployment Framework
 
-Deploy any supported Hugging Face model—including causal text models (e.g. Qwen2.5, Llama 3, Mistral) and multimodal vision/OCR generative models (e.g. GLM-OCR)—by specifying `MODEL_ID` in a single configuration cell with automated hardware preflight validation.
+For deploying open-weights Hugging Face models on free dual NVIDIA Tesla T4 GPUs (32 GB total VRAM) with automated hardware preflight validation and Cloudflare tunneling, use the companion framework:
 
-- **GitHub Source Notebook**: [notebooks/vllm-kaggle.ipynb](notebooks/vllm-kaggle.ipynb) (parameter-driven self-service deployment)
-- **Deployment Runbook**: [docs/kaggle-vllm.md](docs/kaggle-vllm.md) (hardware limits, overrides, preflight guide)
-- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`vllm.sh`, `preflight.py`, `test_image.py`, `cloudflared.sh`, `diagnostics.sh`)
+👉 **[Kaggle LLM Deployment Framework](https://github.com/mosabbir-maruf/kaggle-llm-deployment)**
 
-### 2. Qwen Reference Deployment
-
-A production-tested reference deployment for **Qwen3-Coder-30B-A3B-Instruct** (30.5B MoE, AWQ 4-bit) tuned specifically for dual Tesla T4s.
-
-[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm)
-
-- **Published Kaggle Notebook**: [kaggle.com/code/mosabbir-maruf/qwen-vllm](https://www.kaggle.com/code/mosabbir-maruf/qwen-vllm) (interactive 1-click cloud execution)
-- **GitHub Source Notebook**: [notebooks/qwen-vllm-kaggle.ipynb](notebooks/qwen-vllm-kaggle.ipynb) (version-controlled repository source)
-- **Deployment Runbook**: [docs/kaggle-qwen.md](docs/kaggle-qwen.md) (step-by-step operational runbook & troubleshooting)
-- **Infrastructure Scripts**: [`infra/kaggle/`](infra/kaggle/) (`qwen-vllm.sh`, `cloudflared.sh`, `diagnostics.sh`)
-- **Gateway Configuration**: Set `VLLM_BASE_URL=https://<tunnel-subdomain>.trycloudflare.com/v1` and `VLLM_MODEL=qwen3-coder-30b` in your `.env`.
-
-> [!NOTE]
-> Kaggle provides an ephemeral development and integration testing environment. Sessions are temporary and may terminate based on Kaggle runtime limits or inactivity. It is intended for development and evaluation, not persistent production infrastructure.
+- **Features**: Parameter-driven model selection, memory-aware preflight inspection (`preflight.py`), automatic processor dependency bootstrapping (`num2words` for SmolVLM2), idempotent process management (`vllm.sh`), dual-mode Cloudflare tunneling (`cloudflared.sh`), and 10-point diagnostics (`diagnostics.sh`).
+- **Verified Models**: Qwen 2.5 Coder 7B, Llama 3.1 8B, SmolVLM2 2.2B, DeepSeek R1 Distill Qwen 7B, Qwen3 Coder 30B AWQ.
+- **Relay Integration Runbook**: See [Self-Hosted Models in Relay](docs/self-hosted-models.md) and [OpenAI-Compatible & vLLM Setup](docs/openai-compatible-setup.md).
 
 ---
 
@@ -529,11 +516,6 @@ Relay/
 │       │   ├── registry/        # ProviderRegistry
 │       │   └── routing/         # ModelRouter and alias resolution engine
 │       └── tests/            # Provider and router test suite
-├── infra/
-│   └── kaggle/               # Reusable Kaggle deployment and diagnostic scripts
-├── notebooks/
-│   ├── vllm-kaggle.ipynb      # Generic self-service Hugging Face → vLLM runbook
-│   └── qwen-vllm-kaggle.ipynb # Canonical executable Kaggle deployment runbook
 ├── docs/                     # Technical architecture and feature documentation
 ├── LICENSE                   # MIT License
 └── package.json              # Monorepo workspace configuration
@@ -544,8 +526,7 @@ Relay/
 ## Documentation Index
 
 - [Architecture Overview](docs/architecture.md): Lifecycle diagrams, package layering, and design principles.
-- [Self-Hosted vLLM on Kaggle](docs/kaggle-vllm.md): Generic parameter-driven deployment guide and hardware compatibility reference.
-- [Self-Hosted Qwen/vLLM on Kaggle](docs/kaggle-qwen.md): Complete deployment runbook and verified configuration for dual T4 GPUs.
+- [Self-Hosted Models Guide](docs/self-hosted-models.md): Integrating self-hosted endpoints with Relay, model aliasing, and Kaggle deployment workflows.
 - [Model Routing, Aliases & Fallbacks](docs/routing-and-fallbacks.md): Policy configuration, cycle detection, and fallback mechanics.
 - [Circuit Breaker Foundation](docs/circuit-breaker.md): State transitions, thresholds, and failure classification.
 - [Rate Limiting](docs/rate-limiting.md): Fixed-window algorithm, keying strategies, headers, and memory limits.
