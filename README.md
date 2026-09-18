@@ -45,8 +45,7 @@ Relay is a provider-agnostic LLM gateway and control plane built with Node.js, T
   - `GET /health` with cached upstream connectivity probes (`?refresh=true` supported).
 - **Supported Provider Integrations**:
   - **Google Gemini**: Native adapter supporting configured Gemini models (such as `gemini-2.5-flash` and `gemini-2.5-pro`) and features supported by the provider contract (streaming, tool calling, vision, structured outputs).
-  - **Qwen3-Coder via vLLM**: Verified first-class configuration for self-hosted `qwen3-coder-30b` running on dual NVIDIA Tesla T4 GPUs.
-  - **OpenAI-Compatible Backends**: Generic adapter compatible with configured OpenAI-compatible endpoints (designed to work with vLLM, Ollama, LM Studio, Groq, Together, DeepSeek, and OpenAI).
+  - **OpenAI-Compatible Backends**: Generic adapter compatible with configured OpenAI-compatible endpoints (designed to work with self-hosted vLLM, Ollama, LM Studio, or cloud providers such as Groq, Together, DeepSeek, and OpenAI). Relay operates purely as an API gateway consuming standard `/v1` endpoints and does not manage GPU hardware, CUDA drivers, or model lifecycles.
   - **Extensible Multi-Provider JSON**: Add arbitrary additional backends dynamically via `ADDITIONAL_PROVIDERS` without touching gateway code.
 - **Collision-Safe Model Routing**:
   - **Exact Bare IDs**: Route unambiguous model names directly (e.g. `gemini-2.5-flash`).
@@ -190,13 +189,13 @@ Relay supports any self-hosted LLM inference backend adhering to the OpenAI REST
 
 ### Turn-Key Deployment via Kaggle LLM Deployment Framework
 
-For deploying open-weights Hugging Face models on free dual NVIDIA Tesla T4 GPUs (32 GB total VRAM) with automated hardware preflight validation and Cloudflare tunneling, use the companion framework:
+For deploying open-weights Hugging Face models on free dual NVIDIA Tesla T4 GPUs (2× 16 GB nominal GDDR6, ~29.4 GiB usable VRAM) with automated hardware preflight validation and Cloudflare tunneling, use the companion framework:
 
-👉 **[Kaggle LLM Deployment Framework](https://github.com/mosabbir-maruf/kaggle-llm-deployment)**
+**[Kaggle LLM Deployment Framework](https://github.com/mosabbir-maruf/kaggle-llm-deployment)**
 
 - **Features**: Parameter-driven model selection, memory-aware preflight inspection (`preflight.py`), automatic processor dependency bootstrapping (`num2words` for SmolVLM2), idempotent process management (`vllm.sh`), dual-mode Cloudflare tunneling (`cloudflared.sh`), and 10-point diagnostics (`diagnostics.sh`).
-- **Verified Models**: Qwen 2.5 Coder 7B, Llama 3.1 8B, SmolVLM2 2.2B, DeepSeek R1 Distill Qwen 7B, Qwen3 Coder 30B AWQ.
-- **Relay Integration Runbook**: See [Self-Hosted Models in Relay](docs/self-hosted-models.md) and [OpenAI-Compatible & vLLM Setup](docs/openai-compatible-setup.md).
+- **Model Compatibility & Status**: See the [Model Roster & Status Matrix](https://github.com/mosabbir-maruf/kaggle-llm-deployment/blob/main/docs/supported-models.md) in the deployment repository for tested models across verification and configuration dimensions.
+- **Relay Integration Runbook**: See [Self-Hosted Models in Relay](docs/self-hosted-models.md) and [OpenAI-Compatible & vLLM Setup](docs/openai-compatible-setup.md). Relay operates strictly as an upstream gateway consumer and does not manage model lifecycles or GPU hardware.
 
 ---
 
@@ -386,7 +385,7 @@ curl -X GET http://localhost:3000/v1/models
 ```
 
 > [!NOTE]
-> The capability metadata reflects the model/backend capability contract (for example, `maxContextTokens: 32768` for Qwen3-Coder-30B), while runtime deployments may constrain the context window further (such as the verified Kaggle/vLLM configuration using `--max-model-len 4096`).
+> The capability metadata reflects the model/backend capability contract (for example, `maxContextTokens: 32768` for Qwen3-Coder-30B), while runtime deployments may constrain the context window further (such as self-hosted vLLM deployments that set `--max-model-len 4096` to conserve VRAM).
 
 ### 3. Non-Streaming Chat Completion
 

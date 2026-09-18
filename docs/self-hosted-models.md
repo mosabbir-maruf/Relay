@@ -46,9 +46,9 @@ It is critical to distinguish between the **deployment layer** and the **gateway
 
 You can run any self-hosted engine (vLLM, Ollama, TGI, SGLang) on any platform.
 
-If you want a free, turn-key, parameter-driven workflow on dual NVIDIA Tesla T4 GPUs (32 GB total VRAM), use the standalone deployment framework:
+If you want a free, turn-key, parameter-driven workflow on dual NVIDIA Tesla T4 GPUs (2× 16 GB nominal GDDR6, ~29.4 GiB usable VRAM), use the standalone deployment framework:
 
-👉 **[Kaggle LLM Deployment Framework](https://github.com/mosabbir-maruf/kaggle-llm-deployment)**
+**[Kaggle LLM Deployment Framework](https://github.com/mosabbir-maruf/kaggle-llm-deployment)**
 
 The Kaggle LLM Deployment repository includes:
 
@@ -69,9 +69,9 @@ After your self-hosted inference server starts:
 2. **Cloudflare Quick Tunnel** (Development & Prototyping):
    - Base URL: `https://<random-id>.trycloudflare.com/v1`
    - _Note_: Quick Tunnels do not support Server-Sent Events (SSE). Uncheck `Stream` in Relay Playground or disable streaming when using Quick Tunnels.
-3. **Cloudflare Named Tunnel / Custom Domain** (Production):
+3. **Cloudflare Named Tunnel / Custom Domain** (Persistent):
    - Base URL: `https://llm.yourdomain.com/v1`
-   - Fully supports real-time bidirectional SSE streaming.
+   - Use a managed/named Cloudflare Tunnel when SSE streaming is required. Note that the origin server must correctly return `Content-Type: text/event-stream` for SSE streaming to function properly.
 
 Verify that the endpoint responds:
 
