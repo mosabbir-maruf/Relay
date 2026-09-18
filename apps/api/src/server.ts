@@ -21,6 +21,7 @@ export function createRegistry(config: RelayConfig): ProviderRegistry {
       name: string;
       baseUrl: string;
       apiKey?: string;
+      defaultCapabilities?: { supportsVision?: boolean };
     } = {
       id: backend.id,
       name: backend.name,
@@ -28,6 +29,11 @@ export function createRegistry(config: RelayConfig): ProviderRegistry {
     };
     if (backend.apiKey) {
       providerOptions.apiKey = backend.apiKey;
+    }
+    if (backend.supportsVision !== undefined) {
+      providerOptions.defaultCapabilities = {
+        supportsVision: backend.supportsVision,
+      };
     }
     const provider = new OpenAICompatibleProvider(providerOptions);
     registry.registerProvider(provider);

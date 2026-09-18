@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { z } from 'zod';
-import type { ModelInfo, ModelRoutingRule } from '@relay/core';
+import { isMultimodalModelId, type ModelInfo, type ModelRoutingRule } from '@relay/core';
 
 function tryLoadEnv(): void {
   if (typeof process.loadEnvFile !== 'function') return;
@@ -114,6 +114,7 @@ const AdditionalProviderItemSchema = z.object({
     .array(z.string().trim().min(1, 'Model id must not be empty'))
     .min(1, 'Provider must define at least one model')
     .optional(),
+  supportsVision: z.boolean().optional(),
 });
 
 export const EnvironmentSchema = z.object({
@@ -205,6 +206,7 @@ export interface OpenAiCompatibleBackendConfig {
   readonly baseUrl: string;
   readonly apiKey?: string;
   readonly models: readonly string[];
+  readonly supportsVision?: boolean;
 }
 
 export interface RelayConfig {
@@ -214,27 +216,7 @@ export interface RelayConfig {
   readonly routingPolicies: readonly ModelRoutingRule[];
 }
 
-/**
- * Model-ID heuristic fallback for detecting multimodal/vision models.
- * Note: Strictly a lowest-priority fallback heuristic; never authoritative over explicit capabilities.
- */
-export function isMultimodalModelId(modelId: string): boolean {
-  const lower = modelId.toLowerCase();
-  return (
-    lower.includes('vlm') ||
-    lower.includes('vision') ||
-    lower.includes('-vl') ||
-    lower.includes('vl-') ||
-    lower.includes('ocr') ||
-    lower.includes('idefics') ||
-    lower.includes('llava') ||
-    lower.includes('pixtral') ||
-    lower.includes('paligemma') ||
-    lower.includes('florence') ||
-    lower.includes('smolvlm') ||
-    lower.includes('gemini')
-  );
-}
+export { isMultimodalModelId };
 
 export function resolveModelVisionCapability(
   modelId: string,
@@ -325,21 +307,16 @@ export function loadConfig(
           .filter(Boolean)
       : ['openai-compatible-default'];
 
-    const backend: {
-      id: string;
-      name: string;
-      baseUrl: string;
-      apiKey?: string;
-      models: readonly string[];
-    } = {
+    const backend: OpenAiCompatibleBackendConfig = {
       id: 'openai-compatible',
       name: env.OPENAI_COMPATIBLE_NAME,
       baseUrl: env.OPENAI_COMPATIBLE_BASE_URL,
       models: modelIds,
+      ...(env.OPENAI_COMPATIBLE_API_KEY ? { apiKey: env.OPENAI_COMPATIBLE_API_KEY } : {}),
+      ...(env.OPENAI_COMPATIBLE_SUPPORTS_VISION !== undefined
+        ? { supportsVision: env.OPENAI_COMPATIBLE_SUPPORTS_VISION }
+        : {}),
     };
-    if (env.OPENAI_COMPATIBLE_API_KEY) {
-      backend.apiKey = env.OPENAI_COMPATIBLE_API_KEY;
-    }
     openAiCompatibleBackends.push(backend);
   }
 
@@ -360,21 +337,16 @@ export function loadConfig(
     }
     const modelIds = rawModels.length > 0 ? rawModels : ['default'];
 
-    const backend: {
-      id: string;
-      name: string;
-      baseUrl: string;
-      apiKey?: string;
-      models: readonly string[];
-    } = {
+    const backend: OpenAiCompatibleBackendConfig = {
       id: 'vllm',
       name: 'vLLM',
       baseUrl: env.VLLM_BASE_URL,
       models: modelIds,
+      ...(env.VLLM_API_KEY ? { apiKey: env.VLLM_API_KEY } : {}),
+      ...(env.VLLM_SUPPORTS_VISION !== undefined
+        ? { supportsVision: env.VLLM_SUPPORTS_VISION }
+        : {}),
     };
-    if (env.VLLM_API_KEY) {
-      backend.apiKey = env.VLLM_API_KEY;
-    }
     openAiCompatibleBackends.push(backend);
   }
 
@@ -453,6 +425,7 @@ export function loadConfig(
         baseUrl: item.baseUrl,
         ...(item.apiKey ? { apiKey: item.apiKey } : {}),
         models: item.models ?? [item.id],
+        ...(item.supportsVision !== undefined ? { supportsVision: item.supportsVision } : {}),
       });
     }
   }
@@ -461,12 +434,7 @@ export function loadConfig(
     for (const modelId of backend.models) {
       const isVllm = backend.id === 'vllm';
       const maxContextTokens = isVllm && env.VLLM_MAX_MODEL_LEN ? env.VLLM_MAX_MODEL_LEN : 32768;
-      const explicitVision =
-        isVllm && env.VLLM_SUPPORTS_VISION !== undefined
-          ? env.VLLM_SUPPORTS_VISION
-          : env.OPENAI_COMPATIBLE_SUPPORTS_VISION !== undefined
-            ? env.OPENAI_COMPATIBLE_SUPPORTS_VISION
-            : undefined;
+      const explicitVision = backend.supportsVision;
       const visionResult = resolveModelVisionCapability(modelId, explicitVision);
       defaultModels.push({
         id: modelId,

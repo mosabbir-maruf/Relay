@@ -14,6 +14,7 @@ import type {
   ToolCall,
 } from '@relay/core';
 import {
+  isMultimodalModelId,
   RelayProviderUnavailableError,
   RelayRequestCancelledError,
   RelayTimeoutError,
@@ -74,13 +75,19 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
   getCapabilities(model: string): ProviderCapabilities {
     const upstream = this.upstreamModels.get(model);
-    if (upstream?.max_model_len !== undefined && upstream.max_model_len > 0) {
-      return {
-        ...this.capabilities,
-        maxContextTokens: upstream.max_model_len,
-      };
-    }
-    return this.capabilities;
+    const maxContextTokens =
+      upstream?.max_model_len !== undefined && upstream.max_model_len > 0
+        ? upstream.max_model_len
+        : this.capabilities.maxContextTokens;
+
+    const supportsVision =
+      this.capabilities.supportsVision || (model ? isMultimodalModelId(model) : false);
+
+    return {
+      ...this.capabilities,
+      maxContextTokens,
+      supportsVision,
+    };
   }
 
   getUpstreamModel(modelId: string): UpstreamModelMetadata | undefined {

@@ -396,4 +396,35 @@ describe('OpenAICompatibleProvider', () => {
     expect(provider.getUpstreamModel('llama-3')?.max_model_len).toBe(8192);
     expect(provider.getCapabilities('llama-3').maxContextTokens).toBe(8192);
   });
+
+  it('determines supportsVision dynamically from model ID heuristics and defaultCapabilities', () => {
+    const defaultProvider = new OpenAICompatibleProvider({
+      id: 'default-provider',
+      baseUrl: 'http://localhost:8000/v1',
+    });
+
+    // Multimodal models detected via isMultimodalModelId
+    expect(
+      defaultProvider.getCapabilities('HuggingFaceTB/SmolVLM2-500M-Instruct').supportsVision,
+    ).toBe(true);
+    expect(defaultProvider.getCapabilities('smolvlm2-500m').supportsVision).toBe(true);
+    expect(defaultProvider.getCapabilities('gemini-1.5-flash').supportsVision).toBe(true);
+    expect(defaultProvider.getCapabilities('pixtral-12b').supportsVision).toBe(true);
+    expect(defaultProvider.getCapabilities('llava-v1.6-7b').supportsVision).toBe(true);
+
+    // Text-only models
+    expect(defaultProvider.getCapabilities('qwen3-coder-30b').supportsVision).toBe(false);
+    expect(defaultProvider.getCapabilities('meta-llama/Llama-3-8b-instruct').supportsVision).toBe(
+      false,
+    );
+
+    // When defaultCapabilities explicitly enables supportsVision
+    const visionProvider = new OpenAICompatibleProvider({
+      id: 'vision-provider',
+      baseUrl: 'http://localhost:8000/v1',
+      defaultCapabilities: { supportsVision: true },
+    });
+    expect(visionProvider.getCapabilities('arbitrary-custom-model').supportsVision).toBe(true);
+    expect(visionProvider.getCapabilities('qwen3-coder-30b').supportsVision).toBe(true);
+  });
 });

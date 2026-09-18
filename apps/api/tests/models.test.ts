@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderRegistry } from '@relay/providers';
+import { OpenAICompatibleProvider, ProviderRegistry } from '@relay/providers';
 import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config/index.js';
 import { TestMockProvider } from './mock-provider.js';
@@ -328,5 +328,80 @@ describe('GET /v1/models', () => {
     const namedData = JSON.parse(namedRes.body);
     expect(namedData.id).toBe('named-model');
     expect(namedData.is_quick_tunnel).toBeUndefined();
+  });
+
+  it('preserves model capabilities including supportsVision and imageTokens with OpenAI-compatible provider', async () => {
+    const config = loadConfig({ LOG_LEVEL: 'silent' });
+    const registry = new ProviderRegistry();
+    const vllmProvider = new OpenAICompatibleProvider({
+      id: 'vllm',
+      name: 'vLLM',
+      baseUrl: 'http://localhost:8000/v1',
+    });
+    registry.registerProvider(vllmProvider);
+
+    registry.registerModel({
+      id: 'HuggingFaceTB/SmolVLM2-500M-Instruct',
+      name: 'SmolVLM2 500M Instruct',
+      provider: 'vllm',
+      capabilities: {
+        supportsStreaming: true,
+        supportsToolCalling: false,
+        supportsVision: true,
+        supportsStructuredOutput: false,
+        maxContextTokens: 8192,
+        maxOutputTokens: 4096,
+        imageTokens: 576,
+      },
+    });
+
+    registry.registerModel({
+      id: 'qwen3-coder-30b',
+      name: 'Qwen 3 Coder',
+      provider: 'vllm',
+      capabilities: {
+        supportsStreaming: true,
+        supportsToolCalling: true,
+        supportsVision: false,
+        supportsStructuredOutput: true,
+        maxContextTokens: 32768,
+        maxOutputTokens: 4096,
+      },
+    });
+
+    const app = await createApp({
+      config,
+      registry,
+      serverOptions: { logger: false },
+    });
+
+    // 1. List /v1/models
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models',
+    });
+    expect(listRes.statusCode).toBe(200);
+    const listBody = JSON.parse(listRes.body);
+
+    const smolVlm = listBody.data.find(
+      (m: { id: string }) => m.id === 'HuggingFaceTB/SmolVLM2-500M-Instruct',
+    );
+    expect(smolVlm).toBeDefined();
+    expect(smolVlm.capabilities.supportsVision).toBe(true);
+    expect(smolVlm.capabilities.imageTokens).toBe(576);
+
+    const qwen = listBody.data.find((m: { id: string }) => m.id === 'qwen3-coder-30b');
+    expect(qwen).toBeDefined();
+    expect(qwen.capabilities.supportsVision).toBe(false);
+
+    // 2. Single model lookup GET /v1/models/:model
+    const singleRes = await app.inject({
+      method: 'GET',
+      url: '/v1/models/HuggingFaceTB/SmolVLM2-500M-Instruct',
+    });
+    expect(singleRes.statusCode).toBe(200);
+    const singleBody = JSON.parse(singleRes.body);
+    expect(singleBody.capabilities.supportsVision).toBe(true);
+    expect(singleBody.capabilities.imageTokens).toBe(576);
   });
 });

@@ -19,6 +19,7 @@ export type {
 } from './types/chat.js';
 
 export type { ModelCapabilities, ModelInfo } from './types/model.js';
+export { isMultimodalModelId } from './types/model.js';
 
 // Interfaces & Contracts
 export type {

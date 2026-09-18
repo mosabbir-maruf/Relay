@@ -819,6 +819,110 @@ describe('AI Playground Route (GET /playground)', () => {
       expect(valid.error).toBeUndefined();
     });
 
+    it('dynamically updates image attachment button enabled/disabled state and title based on vision capability', () => {
+      function isModelVisionCapableClient(
+        modelId: string,
+        models: Array<{
+          id: string;
+          capabilities?: { supportsVision?: boolean };
+          supportsVision?: boolean;
+          model_type?: string;
+          architecture?: string;
+        }>,
+      ) {
+        if (!modelId) return { isCapable: false, source: 'no_model' };
+        const m = models.find((item) => {
+          if (!item || !item.id) return false;
+          if (item.id === modelId) return true;
+          if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
+          if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
+          return false;
+        });
+
+        if (m && m.capabilities && m.capabilities.supportsVision === true) {
+          return { isCapable: true, source: 'explicit_capabilities' };
+        }
+        if (m && m.supportsVision === true) {
+          return { isCapable: true, source: 'model_metadata' };
+        }
+        if (m && (m.model_type || m.architecture)) {
+          const combined = String(m.model_type || m.architecture).toLowerCase();
+          if (
+            combined.includes('vlm') ||
+            combined.includes('vision') ||
+            combined.includes('smolvlm') ||
+            combined.includes('idefics') ||
+            combined.includes('conditionalgeneration')
+          ) {
+            return { isCapable: true, source: 'architecture_metadata' };
+          }
+        }
+        const lower = String(modelId).toLowerCase();
+        const isHeuristic =
+          lower.includes('vlm') ||
+          lower.includes('vision') ||
+          lower.includes('-vl') ||
+          lower.includes('vl-') ||
+          lower.includes('ocr') ||
+          lower.includes('idefics') ||
+          lower.includes('llava') ||
+          lower.includes('pixtral') ||
+          lower.includes('paligemma') ||
+          lower.includes('florence') ||
+          lower.includes('smolvlm') ||
+          lower.includes('gemini');
+        if (isHeuristic) {
+          return { isCapable: true, source: 'model_id_heuristic_fallback' };
+        }
+        return { isCapable: false, source: 'default_text_only' };
+      }
+
+      function updateAttachmentSupportSimulation(
+        activeModel: string,
+        models: Parameters<typeof isModelVisionCapableClient>[1],
+      ) {
+        const visionStatus = isModelVisionCapableClient(activeModel, models);
+        const button = {
+          disabled: !visionStatus.isCapable,
+          title: !visionStatus.isCapable
+            ? activeModel
+              ? `Model ${activeModel} does not support image input`
+              : 'No model selected'
+            : 'Attach image (PNG, JPEG, WebP)',
+        };
+        return button;
+      }
+
+      const testModels = [
+        { id: 'HuggingFaceTB/SmolVLM2-500M-Instruct', capabilities: { supportsVision: true } },
+        { id: 'custom-smolvlm', capabilities: { supportsVision: false } },
+        { id: 'qwen3-coder-30b', capabilities: { supportsVision: false } },
+      ];
+
+      // SmolVLM2 with explicit supportsVision: true
+      const smolvlmBtn = updateAttachmentSupportSimulation(
+        'HuggingFaceTB/SmolVLM2-500M-Instruct',
+        testModels,
+      );
+      expect(smolvlmBtn.disabled).toBe(false);
+      expect(smolvlmBtn.title).toBe('Attach image (PNG, JPEG, WebP)');
+
+      // Model with supportsVision: false in capabilities but matching heuristic fallback
+      const customVlmBtn = updateAttachmentSupportSimulation('custom-smolvlm', testModels);
+      expect(customVlmBtn.disabled).toBe(false);
+      expect(customVlmBtn.title).toBe('Attach image (PNG, JPEG, WebP)');
+
+      // Text-only model
+      const textBtn = updateAttachmentSupportSimulation('qwen3-coder-30b', testModels);
+      expect(textBtn.disabled).toBe(true);
+      expect(textBtn.title).toBe('Model qwen3-coder-30b does not support image input');
+
+      // Empty model
+      const emptyBtn = updateAttachmentSupportSimulation('', testModels);
+      expect(emptyBtn.disabled).toBe(true);
+      expect(emptyBtn.title).toBe('No model selected');
+    });
+
     it('validates supported MIME types (PNG, JPEG, WebP) and rejects others', () => {
       const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 

@@ -1482,6 +1482,7 @@ export function renderPlaygroundHtml(): string {
         if (state.models.length === 0) {
           elements.modelSelect.innerHTML = '<option value="">No models available</option>';
           setHealthStatus('unavailable', 'No Models', 'No models configured');
+          updateAttachmentSupport();
           return;
         }
 
@@ -1537,22 +1538,24 @@ export function renderPlaygroundHtml(): string {
      * 4. model-id heuristic fallback (lowest priority)
      */
     function isModelVisionCapable(modelId) {
-      if (!modelId || !Array.isArray(state.models)) return { isCapable: false, source: 'no_model' };
-      const m = state.models.find(item => {
-        if (!item || !item.id) return false;
-        if (item.id === modelId) return true;
-        if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
-        if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
-        return false;
-      });
+      if (!modelId) return { isCapable: false, source: 'no_model' };
+      const m = Array.isArray(state.models)
+        ? state.models.find(item => {
+            if (!item || !item.id) return false;
+            if (item.id === modelId) return true;
+            if (modelId.includes('/') && item.id === modelId.split('/')[1]) return true;
+            if (item.id.includes('/') && item.id.endsWith('/' + modelId)) return true;
+            return false;
+          })
+        : null;
 
-      // 1. Explicit capabilities.supportsVision
-      if (m && m.capabilities && typeof m.capabilities.supportsVision === 'boolean') {
-        return { isCapable: m.capabilities.supportsVision, source: 'explicit_capabilities' };
+      // 1. Explicit capabilities.supportsVision (if explicitly true, accept immediately)
+      if (m && m.capabilities && m.capabilities.supportsVision === true) {
+        return { isCapable: true, source: 'explicit_capabilities' };
       }
       // 2. Provider / model metadata
-      if (m && typeof m.supportsVision === 'boolean') {
-        return { isCapable: m.supportsVision, source: 'model_metadata' };
+      if (m && m.supportsVision === true) {
+        return { isCapable: true, source: 'model_metadata' };
       }
       // 3. Architecture / model_type metadata
       if (m && (m.model_type || m.architecture)) {
@@ -1567,7 +1570,7 @@ export function renderPlaygroundHtml(): string {
           return { isCapable: true, source: 'architecture_metadata' };
         }
       }
-      // 4. Lowest-priority model-id heuristic fallback
+      // 4. Model-ID heuristic fallback
       const lower = String(modelId).toLowerCase();
       const isHeuristic =
         lower.includes('vlm') ||
@@ -1748,8 +1751,9 @@ export function renderPlaygroundHtml(): string {
       if (elements.attachImageBtn) {
         elements.attachImageBtn.disabled = !visionStatus.isCapable;
         if (!visionStatus.isCapable) {
-          elements.attachImageBtn.title =
-            'Model ' + (state.activeModel || '') + ' does not support image input';
+          elements.attachImageBtn.title = state.activeModel
+            ? 'Model ' + state.activeModel + ' does not support image input'
+            : 'No model selected';
         } else {
           elements.attachImageBtn.title = 'Attach image (PNG, JPEG, WebP)';
         }
@@ -2222,6 +2226,9 @@ export function renderPlaygroundHtml(): string {
               '" does not support image input. Please select a multimodal model (e.g., SmolVLM2 or Gemini).'
           );
           return;
+        }
+        if (elements.imageFileInput) {
+          elements.imageFileInput.value = '';
         }
         elements.imageFileInput.click();
       };
@@ -2698,6 +2705,7 @@ export function renderPlaygroundHtml(): string {
     loadConversation();
     renderConversation();
     autoResizeTextarea();
+    updateAttachmentSupport();
     loadModels();
     startHealthMonitoring();
   </script>

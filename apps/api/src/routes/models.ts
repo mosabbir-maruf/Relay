@@ -1,9 +1,24 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
-import { RelayInvalidRequestError } from '@relay/core';
+import { type ModelCapabilities, RelayInvalidRequestError } from '@relay/core';
 import type { ModelRouter, ProviderRegistry } from '@relay/providers';
 
 interface UpstreamModelSource {
   getUpstreamModel?(modelId: string): { id: string; max_model_len?: number } | undefined;
+}
+
+function resolveEffectiveModelCapabilities(
+  baseCapabilities: ModelCapabilities,
+  providerCaps?: ModelCapabilities | undefined,
+  maxModelLen?: number | undefined,
+): ModelCapabilities {
+  const imageTokens = baseCapabilities.imageTokens ?? providerCaps?.imageTokens;
+  return {
+    ...baseCapabilities,
+    ...(providerCaps ?? {}),
+    supportsVision: baseCapabilities.supportsVision || (providerCaps?.supportsVision ?? false),
+    ...(imageTokens !== undefined ? { imageTokens } : {}),
+    ...(maxModelLen !== undefined && maxModelLen > 0 ? { maxContextTokens: maxModelLen } : {}),
+  };
 }
 
 function getUpstreamMaxModelLen(provider: unknown, modelId: string): number | undefined {
@@ -46,8 +61,13 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
 
       const data = models.map((model) => {
         const provider = options.registry.getProvider(model.provider);
-        const caps = provider?.getCapabilities?.(model.id) ?? model.capabilities;
+        const providerCaps = provider?.getCapabilities?.(model.id);
         const maxModelLen = getUpstreamMaxModelLen(provider, model.id) ?? model.max_model_len;
+        const caps = resolveEffectiveModelCapabilities(
+          model.capabilities,
+          providerCaps,
+          maxModelLen,
+        );
         const isQuickTunnel = isProviderQuickTunnel(provider);
 
         return {
@@ -67,12 +87,15 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
             try {
               const plan = options.router.resolvePlan(policy.model);
               const provider = plan.primary.provider;
-              const caps =
-                provider.getCapabilities?.(plan.primary.modelInfo.id) ??
-                plan.primary.modelInfo.capabilities;
+              const providerCaps = provider.getCapabilities?.(plan.primary.modelInfo.id);
               const maxModelLen =
                 getUpstreamMaxModelLen(provider, plan.primary.modelInfo.id) ??
                 plan.primary.modelInfo.max_model_len;
+              const caps = resolveEffectiveModelCapabilities(
+                plan.primary.modelInfo.capabilities,
+                providerCaps,
+                maxModelLen,
+              );
 
               const isQuickTunnel = isProviderQuickTunnel(provider);
 
@@ -117,12 +140,15 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
         if (options.router) {
           const plan = options.router.resolvePlan(model);
           const provider = plan.primary.provider;
-          const caps =
-            provider.getCapabilities?.(plan.primary.modelInfo.id) ??
-            plan.primary.modelInfo.capabilities;
+          const providerCaps = provider.getCapabilities?.(plan.primary.modelInfo.id);
           const maxModelLen =
             getUpstreamMaxModelLen(provider, plan.primary.modelInfo.id) ??
             plan.primary.modelInfo.max_model_len;
+          const caps = resolveEffectiveModelCapabilities(
+            plan.primary.modelInfo.capabilities,
+            providerCaps,
+            maxModelLen,
+          );
           const isQuickTunnel = isProviderQuickTunnel(provider);
 
           return reply.status(200).send({
@@ -137,9 +163,14 @@ export function createModelsRoutes(options: ModelsRoutesOptions): FastifyPluginA
         }
 
         const { modelInfo, provider } = options.registry.getProviderForModel(model);
-        const caps = provider.getCapabilities?.(modelInfo.id) ?? modelInfo.capabilities;
+        const providerCaps = provider.getCapabilities?.(modelInfo.id);
         const maxModelLen =
           getUpstreamMaxModelLen(provider, modelInfo.id) ?? modelInfo.max_model_len;
+        const caps = resolveEffectiveModelCapabilities(
+          modelInfo.capabilities,
+          providerCaps,
+          maxModelLen,
+        );
         const isQuickTunnel = isProviderQuickTunnel(provider);
 
         return reply.status(200).send({
